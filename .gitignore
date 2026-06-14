@@ -1,0 +1,26 @@
+# סביבה
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# נתונים וקבצים גדולים
+*.json
+*.csv
+*.log
+*.zip
+*.jpg
+*.jpeg
+*.png
+images/
+
+# קבצי ZIP של תוספים
+shushka-*.zip
+footer-helper.zip
+shushka-css.zip
+
+# תיקיות
+footer-helper/
+shushka-css/
