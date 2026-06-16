@@ -189,6 +189,27 @@ function shpk_pin_settings() {
     echo '</form></div>';
 }
 
+/* ── ניקוי ברקודים חד-פעמי ──────────────────────────── */
+add_action('admin_init', function() {
+    if (!isset($_POST['shpk_fix_skus']) || !current_user_can('manage_woocommerce')) return;
+    check_admin_referer('shpk_fix_skus');
+    global $wpdb;
+    $rows = $wpdb->get_results(
+        "SELECT post_id, meta_value FROM {$wpdb->postmeta}
+         WHERE meta_key='_sku' AND meta_value REGEXP '^[0-9]+\\.0+$'"
+    );
+    $fixed = 0;
+    foreach ($rows as $r) {
+        $clean = preg_replace('/\.0+$/', '', $r->meta_value);
+        $wpdb->update($wpdb->postmeta, ['meta_value' => $clean],
+                      ['post_id' => $r->post_id, 'meta_key' => '_sku']);
+        $fixed++;
+    }
+    set_transient('shpk_sku_fix_result', $fixed, MINUTE_IN_SECONDS * 5);
+    wp_redirect(admin_url('admin.php?page=shushka-prices&sku_fixed=1'));
+    exit;
+});
+
 /* ── סנכרון קופה — apply ─────────────────────────────── */
 add_action('admin_init', function() {
     if (!isset($_POST['shpk_prices_apply']) || !current_user_can('manage_woocommerce')) return;
@@ -298,6 +319,28 @@ function shpk_prices_page() {
     if (!isset($_POST['shpk_prices_preview'])) {
         $packed_count = count(wc_get_orders(['status' => ['packed'], 'limit' => -1]));
         echo '<div class="wrap" dir="rtl"><h1>🔄 סנכרון קופה</h1>';
+
+        // sku_fixed notice
+        if (isset($_GET['sku_fixed'])) {
+            $n = (int)get_transient('shpk_sku_fix_result');
+            delete_transient('shpk_sku_fix_result');
+            echo '<div class="notice notice-success is-dismissible"><p>✓ תוקנו ' . $n . ' ברקודים — הוסרה סיומת .0</p></div>';
+        }
+
+        // sku cleanup button
+        global $wpdb;
+        $dirty = (int)$wpdb->get_var(
+            "SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key='_sku' AND meta_value REGEXP '^[0-9]+\\.0+$'"
+        );
+        if ($dirty > 0) {
+            echo '<div style="background:#fff3e0;border:1px solid #ff9800;border-radius:8px;padding:16px 20px;margin-bottom:20px">';
+            echo '<strong>⚠ נמצאו ' . $dirty . ' ברקודים עם סיומת .0</strong> — יש לנקות אותם כדי שההתאמה עם הקופה תעבוד.';
+            echo '<form method="post" style="display:inline;margin-right:16px">';
+            wp_nonce_field('shpk_fix_skus');
+            echo '<input type="hidden" name="shpk_fix_skus" value="1">';
+            submit_button('🔧 נקה ברקודים עכשיו', 'primary', '', false, ['style' => 'margin:8px 0 0']);
+            echo '</form></div>';
+        }
 
         // Section 1: export
         echo '<div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:20px;margin-bottom:24px">';
