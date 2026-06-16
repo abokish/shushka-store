@@ -269,9 +269,20 @@ function shpk_prices_page() {
                 WHERE pm.meta_value = %s OR pm.meta_value = %s
             ", $sku, $sku . '.0'));
             if ($rows) {
-                echo '<table class="wp-list-table widefat fixed striped"><thead><tr><th>ID</th><th>שם</th><th>סטטוס</th><th>סוג</th><th>SKU בDB</th></tr></thead><tbody>';
-                foreach ($rows as $r)
-                    echo '<tr><td>' . $r->ID . '</td><td>' . esc_html($r->post_title) . '</td><td>' . $r->post_status . '</td><td>' . $r->post_type . '</td><td>' . esc_html($r->sku) . '</td></tr>';
+                echo '<table class="wp-list-table widefat fixed striped"><thead><tr><th>ID</th><th>שם</th><th>סטטוס</th><th>סוג</th><th>SKU בDB</th><th>_regular_price</th><th>_sale_price</th><th>_price</th></tr></thead><tbody>';
+                foreach ($rows as $r) {
+                    $prices = $wpdb->get_results($wpdb->prepare(
+                        "SELECT meta_key, meta_value FROM {$wpdb->postmeta}
+                         WHERE post_id = %d AND meta_key IN ('_price','_regular_price','_sale_price')",
+                        $r->ID
+                    ));
+                    $pm = [];
+                    foreach ($prices as $p) $pm[$p->meta_key] = $p->meta_value;
+                    echo '<tr><td>' . $r->ID . '</td><td>' . esc_html($r->post_title) . '</td><td>' . $r->post_status . '</td><td>' . $r->post_type . '</td><td>' . esc_html($r->sku) . '</td>';
+                    echo '<td>' . ($pm['_regular_price'] ?? '—') . '</td>';
+                    echo '<td>' . ($pm['_sale_price'] ?? '—') . '</td>';
+                    echo '<td>' . ($pm['_price'] ?? '—') . '</td></tr>';
+                }
                 echo '</tbody></table>';
             } else {
                 echo '<div class="notice notice-error"><p>❌ לא נמצא שום מוצר עם SKU זה בבסיס הנתונים.</p></div>';
