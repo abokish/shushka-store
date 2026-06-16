@@ -189,6 +189,109 @@ function shpk_pin_settings() {
     echo '</form></div>';
 }
 
+/* ── מיגרציית SKU: קוד פריט → ברקוד (תצוגה מקדימה) ─── */
+add_action('admin_init', function() {
+    if (!isset($_POST['shpk_sku_migrate_preview']) || !current_user_can('manage_woocommerce')) return;
+    check_admin_referer('shpk_sku_migrate_preview');
+
+    $tmp = $_FILES['shpk_migrate_csv']['tmp_name'] ?? '';
+    if (!$tmp) { wp_redirect(admin_url('admin.php?page=shushka-prices&migrate_err=nofile')); exit; }
+
+    $raw     = ltrim(file_get_contents($tmp), "\xEF\xBB\xBF");
+    $lines   = explode("\n", str_replace(["\r\n", "\r"], "\n", trim($raw)));
+    $headers = str_getcsv(array_shift($lines));
+
+    $ci_code = $ci_barcode = $ci_name = null;
+    foreach ($headers as $i => $h) {
+        $h = trim($h);
+        if (mb_strpos($h, 'קוד פריט') !== false) $ci_code    = $i;
+        if (mb_strpos($h, 'ברקוד')    !== false) $ci_barcode = $i;
+        if (mb_strpos($h, 'תאור')     !== false) $ci_name    = $i;
+    }
+    if ($ci_code === null || $ci_barcode === null) {
+        wp_redirect(admin_url('admin.php?page=shushka-prices&migrate_err=cols')); exit;
+    }
+
+    $csv_map = [];
+    foreach ($lines as $line) {
+        if (!trim($line)) continue;
+        $c       = str_getcsv($line);
+        $code    = trim($c[$ci_code]    ?? '');
+        $barcode = preg_replace('/\.0+$/', '', trim($c[$ci_barcode] ?? ''));
+        $name    = trim($c[$ci_name]    ?? '');
+        if ($code !== '' && strlen($barcode) >= 6 && ctype_digit($barcode))
+            $csv_map[$code] = ['barcode' => $barcode, 'name' => $name];
+    }
+    if (!$csv_map) { wp_redirect(admin_url('admin.php?page=shushka-prices&migrate_err=empty')); exit; }
+
+    global $wpdb;
+    $codes_escaped = implode(',', array_map(function($c) use ($wpdb) {
+        return "'" . esc_sql($c) . "'";
+    }, array_keys($csv_map)));
+
+    $rows = $wpdb->get_results(
+        "SELECT p.ID, p.post_title, pm.meta_id, pm.meta_value AS sku
+         FROM {$wpdb->posts} p
+         JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = '_sku'
+         WHERE p.post_type IN ('product','product_variation')
+           AND p.post_status NOT IN ('trash','auto-draft')
+           AND pm.meta_value IN ($codes_escaped)"
+    );
+
+    // find barcodes already used as SKUs (conflict detection)
+    $all_barcodes = array_map(function($d) { return $d['barcode']; }, $csv_map);
+    $bc_escaped   = implode(',', array_map(function($b) use ($wpdb) {
+        return "'" . esc_sql($b) . "'";
+    }, $all_barcodes));
+    $existing     = $wpdb->get_col(
+        "SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_key='_sku' AND meta_value IN ($bc_escaped)"
+    );
+    $existing_set = array_flip($existing);
+
+    $to_migrate = $conflicts = [];
+    foreach ($rows as $r) {
+        $d = $csv_map[$r->sku] ?? null;
+        if (!$d) continue;
+        $name = $r->post_title ?: $d['name'];
+        if (isset($existing_set[$d['barcode']]))
+            $conflicts[] = ['name' => $name, 'code' => $r->sku, 'barcode' => $d['barcode']];
+        else
+            $to_migrate[] = ['id' => (int)$r->ID, 'meta_id' => (int)$r->meta_id,
+                             'name' => $name, 'old_sku' => $r->sku, 'new_sku' => $d['barcode']];
+    }
+
+    $tkey = wp_generate_password(16, false);
+    set_transient('shpk_migrate_' . $tkey,
+                  ['items' => $to_migrate, 'conflicts' => $conflicts],
+                  MINUTE_IN_SECONDS * 30);
+    wp_redirect(admin_url('admin.php?page=shushka-prices&action=migrate_preview&tkey=' . $tkey));
+    exit;
+});
+
+/* ── מיגרציית SKU: אישור ─────────────────────────────── */
+add_action('admin_init', function() {
+    if (!isset($_POST['shpk_sku_migrate_apply']) || !current_user_can('manage_woocommerce')) return;
+    check_admin_referer('shpk_sku_migrate_apply');
+
+    $tkey = sanitize_key($_POST['shpk_tkey'] ?? '');
+    $data = $tkey ? get_transient('shpk_migrate_' . $tkey) : null;
+    if (!$data) { wp_redirect(admin_url('admin.php?page=shushka-prices&migrate_err=expired')); exit; }
+
+    global $wpdb;
+    @set_time_limit(300);
+    $done = 0;
+    foreach ($data['items'] as $u) {
+        $wpdb->update($wpdb->postmeta, ['meta_value' => $u['new_sku']], ['meta_id' => $u['meta_id']]);
+        wc_delete_product_transients($u['id']);
+        clean_post_cache($u['id']);
+        $done++;
+    }
+    delete_transient('shpk_migrate_' . $tkey);
+    set_transient('shpk_migrate_result', $done, MINUTE_IN_SECONDS * 5);
+    wp_redirect(admin_url('admin.php?page=shushka-prices&migrate_done=1'));
+    exit;
+});
+
 /* ── ניקוי ברקודים חד-פעמי ──────────────────────────── */
 add_action('admin_init', function() {
     if (!isset($_POST['shpk_fix_skus']) || !current_user_can('manage_woocommerce')) return;
@@ -341,6 +444,60 @@ function shpk_prices_page() {
         exit;
     }
 
+    // ── מיגרציית SKU: תצוגה מקדימה ──────────────────────
+    if (isset($_GET['action']) && $_GET['action'] === 'migrate_preview') {
+        $tkey = sanitize_key($_GET['tkey'] ?? '');
+        $data = $tkey ? get_transient('shpk_migrate_' . $tkey) : null;
+        if (!$data) {
+            echo '<div class="wrap" dir="rtl"><div class="notice notice-error"><p>פג תוקף — אנא העלה שוב.</p></div>';
+            echo '<p><a href="' . $base . '" class="button">חזרה</a></p></div>'; return;
+        }
+        $items = $data['items']; $conflicts = $data['conflicts'];
+        echo '<div class="wrap" dir="rtl"><h1>🔧 תצוגה מקדימה — עדכון ברקודים</h1>';
+        echo '<div style="display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap">';
+        echo '<span style="background:#e8f5e9;border:1px solid #4caf50;border-radius:8px;padding:8px 16px"><strong>' . count($items) . '</strong> מוצרים יעודכנו</span>';
+        if ($conflicts) echo '<span style="background:#fce4ec;border:1px solid #e91e63;border-radius:8px;padding:8px 16px"><strong>' . count($conflicts) . '</strong> התנגשויות</span>';
+        echo '</div>';
+        if ($items) {
+            echo '<form method="post" style="margin-bottom:20px">';
+            wp_nonce_field('shpk_sku_migrate_apply');
+            echo '<input type="hidden" name="shpk_sku_migrate_apply" value="1">';
+            echo '<input type="hidden" name="shpk_tkey" value="' . esc_attr($tkey) . '">';
+            submit_button('✓ אשר עדכון ' . count($items) . ' מוצרים', 'primary large', '', false, ['style' => 'font-size:16px']);
+            echo ' &nbsp;<a href="' . $base . '" class="button button-large">ביטול</a>';
+            echo '</form>';
+            echo '<table class="wp-list-table widefat fixed striped"><thead><tr><th>מוצר</th><th style="width:150px">קוד פנימי (ישן)</th><th style="width:180px">ברקוד (חדש)</th></tr></thead><tbody>';
+            foreach ($items as $u)
+                echo '<tr><td>' . esc_html($u['name']) . '</td><td>' . esc_html($u['old_sku']) . '</td><td><strong>' . esc_html($u['new_sku']) . '</strong></td></tr>';
+            echo '</tbody></table>';
+        } else {
+            echo '<div class="notice notice-info"><p>לא נמצאו מוצרים לעדכון.</p></div>';
+        }
+        if ($conflicts) {
+            echo '<h3 style="margin-top:28px">⚠ ברקוד כבר קיים ב-WooCommerce (' . count($conflicts) . ')</h3>';
+            echo '<table class="wp-list-table widefat fixed striped"><thead><tr><th>מוצר</th><th>קוד פנימי</th><th>ברקוד</th></tr></thead><tbody>';
+            foreach ($conflicts as $c)
+                echo '<tr><td>' . esc_html($c['name']) . '</td><td>' . esc_html($c['code']) . '</td><td>' . esc_html($c['barcode']) . '</td></tr>';
+            echo '</tbody></table>';
+        }
+        echo '</div>'; return;
+    }
+
+    // ── מיגרציית SKU: סיום ───────────────────────────────
+    if (isset($_GET['migrate_done'])) {
+        $n = (int)get_transient('shpk_migrate_result');
+        delete_transient('shpk_migrate_result');
+        echo '<div class="wrap" dir="rtl"><h1>🔧 עדכון ברקודים</h1>';
+        echo '<div class="notice notice-success is-dismissible"><p>✓ עודכנו ' . $n . ' מוצרים — מעכשיו הסנכרון יעבוד לפי ברקוד.</p></div>';
+        echo '<p><a href="' . $base . '" class="button button-primary">חזרה לסנכרון</a></p></div>'; return;
+    }
+    if (isset($_GET['migrate_err'])) {
+        $msgs = ['nofile' => 'לא נבחר קובץ.', 'cols' => 'לא נמצאו עמודות "קוד פריט" ו"ברקוד".', 'empty' => 'לא נמצאו נתונים תקינים בקובץ.', 'expired' => 'פג תוקף — אנא העלה שוב.'];
+        echo '<div class="wrap" dir="rtl"><h1>🔧 עדכון ברקודים</h1>';
+        echo '<div class="notice notice-error"><p>' . esc_html($msgs[$_GET['migrate_err']] ?? 'שגיאה.') . '</p></div>';
+        echo '<p><a href="' . $base . '" class="button">חזרה</a></p></div>'; return;
+    }
+
     // ── after apply ──────────────────────────────────────
     if (isset($_GET['done'])) {
         $r = get_transient('shpk_pr_result');
@@ -418,6 +575,17 @@ function shpk_prices_page() {
         echo '<label style="font-size:15px;display:flex;align-items:center;gap:8px"><input type="checkbox" name="do_stock" value="1"> <strong>עדכן מלאי</strong> <span style="color:#888;font-size:13px">(מלאי 0 מהקופה לא יעודכן — יוצג בנפרד)</span></label>';
         echo '</div>';
         submit_button('📋 טען ותצוגה מקדימה', 'primary large');
+        echo '</form></div>';
+
+        // Section 3: SKU migration
+        echo '<div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:20px;margin-top:24px">';
+        echo '<h2 style="margin-top:0">🔧 עדכון מזהי מוצרים לברקוד <span style="font-size:13px;font-weight:400;color:#888">(פעולה חד-פעמית)</span></h2>';
+        echo '<p style="color:#555">מחליפה את הקוד הפנימי של הקופה ב-SKU עם הברקוד האמיתי, כדי שהסנכרון יעבוד נכון ויבוא הזמנות לקופה יזהה את המוצרים.</p>';
+        echo '<form method="post" enctype="multipart/form-data">';
+        wp_nonce_field('shpk_sku_migrate_preview');
+        echo '<input type="hidden" name="shpk_sku_migrate_preview" value="1">';
+        echo '<input type="file" name="shpk_migrate_csv" accept=".csv" required style="margin:12px 0;display:block;font-size:15px">';
+        submit_button('📋 טען ותצוגה מקדימה', 'secondary large');
         echo '</form></div></div>';
         return;
     }
