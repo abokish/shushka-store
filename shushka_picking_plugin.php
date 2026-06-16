@@ -243,6 +243,27 @@ add_action('admin_init', function() {
     }
 });
 
+/* ── הסתרת מוצרים לא פעילים ─────────────────────────── */
+add_action('admin_init', function() {
+    if (!isset($_POST['shpk_hide_inactive']) || !current_user_can('manage_woocommerce')) return;
+    check_admin_referer('shpk_hide_inactive');
+    $inactive = get_transient('shpk_inactive_products');
+    if (!$inactive) { wp_redirect(admin_url('admin.php?page=shushka-prices&err=expired')); exit; }
+    @set_time_limit(300);
+    $hidden = 0;
+    foreach ($inactive as $u) {
+        $product = wc_get_product($u['id']);
+        if (!$product) continue;
+        $product->set_catalog_visibility('hidden');
+        $product->save();
+        $hidden++;
+    }
+    delete_transient('shpk_inactive_products');
+    set_transient('shpk_hide_result', $hidden, MINUTE_IN_SECONDS * 5);
+    wp_redirect(admin_url('admin.php?page=shushka-prices&hidden=1'));
+    exit;
+});
+
 /* ── מיגרציית SKU: קוד פריט → ברקוד (תצוגה מקדימה) ─── */
 add_action('admin_init', function() {
     if (!isset($_POST['shpk_sku_migrate_preview']) || !current_user_can('manage_woocommerce')) return;
@@ -522,6 +543,16 @@ function shpk_prices_page() {
         echo '<p><a href="' . $base . '" class="button">חזרה</a></p></div>'; return;
     }
 
+    // ── after hide inactive ───────────────────────────────
+    if (isset($_GET['hidden'])) {
+        $n = (int)get_transient('shpk_hide_result');
+        delete_transient('shpk_hide_result');
+        echo '<div class="wrap" dir="rtl"><h1>🔄 סנכרון קופה</h1>';
+        echo '<div class="notice notice-success is-dismissible"><p>✓ הוסתרו ' . $n . ' מוצרים לא פעילים מהקטלוג.</p></div>';
+        echo '<p><a href="' . $base . '" class="button button-primary">חזרה לסנכרון</a></p></div>';
+        return;
+    }
+
     // ── after apply ──────────────────────────────────────
     if (isset($_GET['done'])) {
         $r = get_transient('shpk_pr_result');
@@ -567,9 +598,22 @@ function shpk_prices_page() {
         // missing products export button
         $missing = get_transient('shpk_missing_products');
         if ($missing) {
-            echo '<div style="background:#e8f4fd;border:1px solid #2196f3;border-radius:8px;padding:16px 20px;margin-bottom:20px;display:flex;align-items:center;gap:20px;flex-wrap:wrap">';
+            echo '<div style="background:#e8f4fd;border:1px solid #2196f3;border-radius:8px;padding:16px 20px;margin-bottom:16px;display:flex;align-items:center;gap:20px;flex-wrap:wrap">';
             echo '<span><strong>' . count($missing) . ' מוצרים</strong> בקופה שאינם באתר</span>';
             echo '<a href="' . admin_url('admin.php?page=shushka-prices&action=export_missing') . '" class="button button-primary">⬇ ייצא CSV של מוצרים חסרים</a>';
+            echo '</div>';
+        }
+
+        // inactive products banner
+        $inactive_saved = get_transient('shpk_inactive_products');
+        if ($inactive_saved) {
+            echo '<div style="background:#fff3e0;border:1px solid #ff9800;border-radius:8px;padding:16px 20px;margin-bottom:16px;display:flex;align-items:center;gap:20px;flex-wrap:wrap">';
+            echo '<span><strong>' . count($inactive_saved) . ' מוצרים</strong> לא פעילים זוהו בסנכרון האחרון</span>';
+            echo '<form method="post" style="margin:0">';
+            wp_nonce_field('shpk_hide_inactive');
+            echo '<input type="hidden" name="shpk_hide_inactive" value="1">';
+            echo '<button type="submit" class="button button-primary" style="background:#e65100;border-color:#e65100">🙈 הסתר ' . count($inactive_saved) . ' מוצרים מהקטלוג</button>';
+            echo '</form>';
             echo '</div>';
         }
 
@@ -603,9 +647,10 @@ function shpk_prices_page() {
         wp_nonce_field('shpk_prices_preview');
         echo '<input type="hidden" name="shpk_prices_preview" value="1">';
         echo '<input type="file" name="shpk_csv" accept=".csv" required style="margin:12px 0;display:block;font-size:15px">';
-        echo '<div style="margin:12px 0;display:flex;gap:24px;flex-wrap:wrap">';
+        echo '<div style="margin:12px 0;display:flex;flex-direction:column;gap:10px">';
         echo '<label style="font-size:15px;display:flex;align-items:center;gap:8px"><input type="checkbox" name="do_prices" value="1" checked> <strong>עדכן מחירים</strong></label>';
-        echo '<label style="font-size:15px;display:flex;align-items:center;gap:8px"><input type="checkbox" name="do_stock" value="1"> <strong>עדכן מלאי</strong> <span style="color:#888;font-size:13px">(מלאי 0 מהקופה לא יעודכן — יוצג בנפרד)</span></label>';
+        echo '<label style="font-size:15px;display:flex;align-items:center;gap:8px"><input type="checkbox" name="do_stock" value="1"> <strong>עדכן מלאי</strong> <span style="color:#888;font-size:13px">(מלאי 0 מהקופה לא יעודכן)</span></label>';
+        echo '<label style="font-size:15px;display:flex;align-items:center;gap:8px"><input type="checkbox" name="do_inactive" value="1" checked> <strong>זהה מוצרים לא פעילים</strong> <span style="color:#888;font-size:13px">— לא נמכרו מעל</span> <input type="number" name="inactive_months" value="6" min="1" max="60" style="width:55px;text-align:center"> <span style="color:#888;font-size:13px">חודשים</span></label>';
         echo '</div>';
         submit_button('📋 טען ותצוגה מקדימה', 'primary large');
         echo '</form></div>';
@@ -625,8 +670,10 @@ function shpk_prices_page() {
 
     // ── parse CSV ────────────────────────────────────────
     check_admin_referer('shpk_prices_preview');
-    $do_prices = !empty($_POST['do_prices']);
-    $do_stock  = !empty($_POST['do_stock']);
+    $do_prices       = !empty($_POST['do_prices']);
+    $do_stock        = !empty($_POST['do_stock']);
+    $do_inactive     = !empty($_POST['do_inactive']);
+    $inactive_months = max(1, (int)($_POST['inactive_months'] ?? 6));
     $tmp = $_FILES['shpk_csv']['tmp_name'] ?? '';
     if (!$tmp) { echo '<div class="wrap" dir="rtl"><p class="notice notice-error">לא נבחר קובץ.</p></div>'; return; }
 
@@ -634,13 +681,14 @@ function shpk_prices_page() {
     $lines   = explode("\n", str_replace(["\r\n", "\r"], "\n", trim($raw)));
     $headers = str_getcsv(array_shift($lines));
 
-    $ci_sku = $ci_price = $ci_name = $ci_stock = null;
+    $ci_sku = $ci_price = $ci_name = $ci_stock = $ci_date = null;
     foreach ($headers as $i => $h) {
         $h = trim($h);
         if (mb_strpos($h, 'ברקוד')       !== false) $ci_sku   = $i;
         if (mb_strpos($h, 'מחיר מכירה') !== false) $ci_price = $i;
         if (mb_strpos($h, 'תאור')        !== false) $ci_name  = $i;
         if (mb_strpos($h, 'מלאי')        !== false) $ci_stock = $i;
+        if ($h === 'מכר')                           $ci_date  = $i;
     }
     if ($ci_sku === null || ($do_prices && $ci_price === null) || ($do_stock && $ci_stock === null)) {
         echo '<div class="wrap" dir="rtl"><h1>🔄 סנכרון קופה</h1>';
@@ -654,10 +702,11 @@ function shpk_prices_page() {
         $c     = str_getcsv($line);
         $sku   = preg_replace('/\.0+$/', '', trim($c[$ci_sku] ?? ''));
         if ($sku === '') continue;
-        $price = $ci_price !== null ? (float)str_replace([',', ' '], ['.', ''], trim($c[$ci_price] ?? '')) : null;
-        $stock = $ci_stock !== null ? (int)trim($c[$ci_stock] ?? '') : null;
-        $name  = trim($c[$ci_name] ?? '');
-        $csv[$sku] = ['name' => $name, 'price' => $price, 'stock' => $stock];
+        $price     = $ci_price !== null ? (float)str_replace([',', ' '], ['.', ''], trim($c[$ci_price] ?? '')) : null;
+        $stock     = $ci_stock !== null ? (int)trim($c[$ci_stock] ?? '') : null;
+        $name      = trim($c[$ci_name]  ?? '');
+        $last_sale = $ci_date  !== null ? trim($c[$ci_date]  ?? '') : '';
+        $csv[$sku] = ['name' => $name, 'price' => $price, 'stock' => $stock, 'last_sale' => $last_sale];
     }
     if (!$csv) {
         echo '<div class="wrap" dir="rtl"><h1>🔄 סנכרון קופה</h1>';
@@ -682,8 +731,9 @@ function shpk_prices_page() {
 
     // ── match & build lists ──────────────────────────────
     @set_time_limit(300);
-    $price_changes = []; $stock_changes = []; $stock_zero = []; $not_in_wc = [];
+    $price_changes = []; $stock_changes = []; $stock_zero = []; $not_in_wc = []; $inactive = [];
     $price_same = $stock_same = 0;
+    $threshold = $do_inactive ? new DateTime('-' . $inactive_months . ' months') : null;
 
     foreach ($csv as $sku => $d) {
         if (!isset($wc_map[$sku])) { $not_in_wc[] = $d + ['sku' => $sku]; continue; }
@@ -703,6 +753,14 @@ function shpk_prices_page() {
                 $stock_changes[] = ['id' => $wc_map[$sku], 'sku' => $sku, 'name' => $product->get_name(), 'old_stock' => $old_s, 'new_stock' => $d['stock']];
             else $stock_same++;
         }
+        if ($do_inactive && $threshold && $ci_date !== null) {
+            $last_sale = $d['last_sale'] ?? '';
+            $date      = $last_sale ? DateTime::createFromFormat('d/m/Y', $last_sale) : false;
+            if (!$date || $date < $threshold) {
+                $inactive[] = ['id' => $wc_map[$sku], 'name' => $product->get_name(),
+                               'sku' => $sku, 'last_sale' => $last_sale ?: '—'];
+            }
+        }
     }
 
     // ── store in transient ───────────────────────────────
@@ -714,7 +772,8 @@ function shpk_prices_page() {
         'not_in_wc'  => $not_in_wc,
     ], MINUTE_IN_SECONDS * 30);
     // שמור חסרים בנפרד ל-24 שעות (גם אחרי אישור עדכון)
-    if ($not_in_wc) set_transient('shpk_missing_products', $not_in_wc, DAY_IN_SECONDS);
+    if ($not_in_wc) set_transient('shpk_missing_products',   $not_in_wc, DAY_IN_SECONDS);
+    if ($inactive)  set_transient('shpk_inactive_products', $inactive,  DAY_IN_SECONDS);
 
     // ── preview UI ───────────────────────────────────────
     $total_changes = count($price_changes) + count($stock_changes);
@@ -727,6 +786,7 @@ function shpk_prices_page() {
     if ($do_stock)  $chips[] = ['<strong>' . count($stock_changes) . '</strong> כמויות ישתנו', '#e3f2fd', '#2196f3'];
     if ($do_stock)  $chips[] = ['<strong>' . count($stock_zero) . '</strong> מלאי 0 — לא יעודכנו', '#fff8e1', '#ff9800'];
     if ($not_in_wc) $chips[] = ['<strong>' . count($not_in_wc) . '</strong> לא נמצאו באתר', '#fce4ec', '#e91e63'];
+    if ($do_inactive && $ci_date !== null) $chips[] = ['<strong>' . count($inactive) . '</strong> לא פעילים (מעל ' . $inactive_months . ' חודשים)', '#f3e5f5', '#9c27b0'];
     echo '<div style="display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap">';
     foreach ($chips as [$label, $bg, $border])
         echo '<span style="background:' . $bg . ';border:1px solid ' . $border . ';border-radius:8px;padding:8px 16px;font-size:14px">' . $label . '</span>';
@@ -789,8 +849,19 @@ function shpk_prices_page() {
         echo '</tbody></table>';
     }
 
-    echo '</div>';
-}
+    if ($inactive) {
+        echo '<h3 style="margin-top:28px">😴 מוצרים לא פעילים — לא נמכרו מעל ' . $inactive_months . ' חודשים (' . count($inactive) . ')</h3>';
+        echo '<p style="color:#555">ניתן להסתיר אותם מהקטלוג. הם ישארו ב-WooCommerce אך לא יופיעו בחנות.</p>';
+        echo '<form method="post" style="margin-bottom:16px">';
+        wp_nonce_field('shpk_hide_inactive');
+        echo '<input type="hidden" name="shpk_hide_inactive" value="1">';
+        submit_button('🙈 הסתר ' . count($inactive) . ' מוצרים מהקטלוג', 'delete large', '', false, ['style' => 'font-size:15px']);
+        echo '</form>';
+        echo '<table class="wp-list-table widefat fixed striped"><thead><tr><th>מוצר</th><th style="width:160px">ברקוד</th><th style="width:130px">נמכר לאחרונה</th></tr></thead><tbody>';
+        foreach ($inactive as $u)
+            echo '<tr><td>' . esc_html($u['name']) . '</td><td>' . esc_html($u['sku']) . '</td><td>' . esc_html($u['last_sale']) . '</td></tr>';
+        echo '</tbody></table>';
+    }
 
 /* ── CSS ─────────────────────────────────────────────── */
 function shpk_css() { ?>
