@@ -110,12 +110,17 @@ def main():
     if not csv_files:
         print("לא נמצא קובץ missing-products-*.csv בתיקייה")
         sys.exit(1)
-    csv_file = sorted(csv_files)[-1]
+    csv_file = max(csv_files, key=os.path.getmtime)
     print(f"קורא: {csv_file}")
 
     with open(csv_file, encoding='utf-8-sig') as f:
-        rows = list(csv.DictReader(f))
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        headers = reader.fieldnames or []
 
+    print(f"עמודות שזוהו: {headers}")
+    if rows:
+        print(f"שורה ראשונה: {dict(rows[0])}\n")
     print(f"נמצאו {len(rows)} מוצרים לייבוא\n")
 
     done = skip = fail = 0

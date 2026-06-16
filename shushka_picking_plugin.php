@@ -243,14 +243,15 @@ add_action('admin_init', function() {
     }
 });
 
-/* ── הסתרת מוצרים לא פעילים ─────────────────────────── */
+/* ── עדכון נראות מוצרים (הסתר לא פעילים / שחזר פעילים) */
 add_action('admin_init', function() {
     if (!isset($_POST['shpk_hide_inactive']) || !current_user_can('manage_woocommerce')) return;
     check_admin_referer('shpk_hide_inactive');
-    $inactive = get_transient('shpk_inactive_products');
-    if (!$inactive) { wp_redirect(admin_url('admin.php?page=shushka-prices&err=expired')); exit; }
+    $inactive = get_transient('shpk_inactive_products') ?: [];
+    $restore  = get_transient('shpk_restore_products')  ?: [];
+    if (!$inactive && !$restore) { wp_redirect(admin_url('admin.php?page=shushka-prices&err=expired')); exit; }
     @set_time_limit(300);
-    $hidden = 0;
+    $hidden = $restored = 0;
     foreach ($inactive as $u) {
         $product = wc_get_product($u['id']);
         if (!$product) continue;
@@ -258,8 +259,16 @@ add_action('admin_init', function() {
         $product->save();
         $hidden++;
     }
+    foreach ($restore as $u) {
+        $product = wc_get_product($u['id']);
+        if (!$product) continue;
+        $product->set_catalog_visibility('visible');
+        $product->save();
+        $restored++;
+    }
     delete_transient('shpk_inactive_products');
-    set_transient('shpk_hide_result', $hidden, MINUTE_IN_SECONDS * 5);
+    delete_transient('shpk_restore_products');
+    set_transient('shpk_hide_result', ['hidden' => $hidden, 'restored' => $restored], MINUTE_IN_SECONDS * 5);
     wp_redirect(admin_url('admin.php?page=shushka-prices&hidden=1'));
     exit;
 });
@@ -543,12 +552,20 @@ function shpk_prices_page() {
         echo '<p><a href="' . $base . '" class="button">חזרה</a></p></div>'; return;
     }
 
-    // ── after hide inactive ───────────────────────────────
+    // ── after hide/restore ────────────────────────────────
     if (isset($_GET['hidden'])) {
-        $n = (int)get_transient('shpk_hide_result');
+        $r = get_transient('shpk_hide_result');
         delete_transient('shpk_hide_result');
         echo '<div class="wrap" dir="rtl"><h1>🔄 סנכרון קופה</h1>';
-        echo '<div class="notice notice-success is-dismissible"><p>✓ הוסתרו ' . $n . ' מוצרים לא פעילים מהקטלוג.</p></div>';
+        $msgs = [];
+        if (is_array($r)) {
+            if ($r['hidden']   ?? 0) $msgs[] = '🙈 הוסתרו ' . $r['hidden']   . ' מוצרים לא פעילים';
+            if ($r['restored'] ?? 0) $msgs[] = '👁 שוחזרו ' . $r['restored'] . ' מוצרים לתצוגה';
+        } elseif ((int)$r) {
+            $msgs[] = '🙈 הוסתרו ' . (int)$r . ' מוצרים לא פעילים';
+        }
+        if ($msgs)
+            echo '<div class="notice notice-success is-dismissible"><p>✓ ' . implode(' | ', $msgs) . '.</p></div>';
         echo '<p><a href="' . $base . '" class="button button-primary">חזרה לסנכרון</a></p></div>';
         return;
     }
@@ -604,15 +621,22 @@ function shpk_prices_page() {
             echo '</div>';
         }
 
-        // inactive products banner
+        // inactive / restore banner
         $inactive_saved = get_transient('shpk_inactive_products');
-        if ($inactive_saved) {
+        $restore_saved  = get_transient('shpk_restore_products');
+        if ($inactive_saved || $restore_saved) {
             echo '<div style="background:#fff3e0;border:1px solid #ff9800;border-radius:8px;padding:16px 20px;margin-bottom:16px;display:flex;align-items:center;gap:20px;flex-wrap:wrap">';
-            echo '<span><strong>' . count($inactive_saved) . ' מוצרים</strong> לא פעילים זוהו בסנכרון האחרון</span>';
+            $banner_parts = [];
+            if ($inactive_saved) $banner_parts[] = '<strong>' . count($inactive_saved) . ' מוצרים</strong> לא פעילים';
+            if ($restore_saved)  $banner_parts[] = '<strong>' . count($restore_saved) . ' מוצרים</strong> מוסתרים לשחזור';
+            echo '<span>' . implode(' | ', $banner_parts) . ' זוהו בסנכרון האחרון</span>';
             echo '<form method="post" style="margin:0">';
             wp_nonce_field('shpk_hide_inactive');
             echo '<input type="hidden" name="shpk_hide_inactive" value="1">';
-            echo '<button type="submit" class="button button-primary" style="background:#e65100;border-color:#e65100">🙈 הסתר ' . count($inactive_saved) . ' מוצרים מהקטלוג</button>';
+            $btn_parts = [];
+            if ($inactive_saved) $btn_parts[] = '🙈 הסתר ' . count($inactive_saved);
+            if ($restore_saved)  $btn_parts[] = '👁 שחזר ' . count($restore_saved);
+            echo '<button type="submit" class="button button-primary" style="background:#e65100;border-color:#e65100">' . implode(' | ', $btn_parts) . ' מוצרים</button>';
             echo '</form>';
             echo '</div>';
         }
@@ -731,7 +755,7 @@ function shpk_prices_page() {
 
     // ── match & build lists ──────────────────────────────
     @set_time_limit(300);
-    $price_changes = []; $stock_changes = []; $stock_zero = []; $not_in_wc = []; $inactive = [];
+    $price_changes = []; $stock_changes = []; $stock_zero = []; $not_in_wc = []; $inactive = []; $to_restore = [];
     $price_same = $stock_same = 0;
     $threshold = $do_inactive ? new DateTime('-' . $inactive_months . ' months') : null;
 
@@ -759,6 +783,9 @@ function shpk_prices_page() {
             if (!$date || $date < $threshold) {
                 $inactive[] = ['id' => $wc_map[$sku], 'name' => $product->get_name(),
                                'sku' => $sku, 'last_sale' => $last_sale ?: '—'];
+            } elseif ($product->get_catalog_visibility() === 'hidden') {
+                $to_restore[] = ['id' => $wc_map[$sku], 'name' => $product->get_name(),
+                                 'sku' => $sku, 'last_sale' => $last_sale];
             }
         }
     }
@@ -772,8 +799,9 @@ function shpk_prices_page() {
         'not_in_wc'  => $not_in_wc,
     ], MINUTE_IN_SECONDS * 30);
     // שמור חסרים בנפרד ל-24 שעות (גם אחרי אישור עדכון)
-    if ($not_in_wc) set_transient('shpk_missing_products',   $not_in_wc, DAY_IN_SECONDS);
-    if ($inactive)  set_transient('shpk_inactive_products', $inactive,  DAY_IN_SECONDS);
+    if ($not_in_wc)  set_transient('shpk_missing_products',  $not_in_wc,   DAY_IN_SECONDS);
+    if ($inactive)   set_transient('shpk_inactive_products', $inactive,   DAY_IN_SECONDS);
+    if ($to_restore) set_transient('shpk_restore_products',  $to_restore, DAY_IN_SECONDS);
 
     // ── preview UI ───────────────────────────────────────
     $total_changes = count($price_changes) + count($stock_changes);
@@ -786,7 +814,10 @@ function shpk_prices_page() {
     if ($do_stock)  $chips[] = ['<strong>' . count($stock_changes) . '</strong> כמויות ישתנו', '#e3f2fd', '#2196f3'];
     if ($do_stock)  $chips[] = ['<strong>' . count($stock_zero) . '</strong> מלאי 0 — לא יעודכנו', '#fff8e1', '#ff9800'];
     if ($not_in_wc) $chips[] = ['<strong>' . count($not_in_wc) . '</strong> לא נמצאו באתר', '#fce4ec', '#e91e63'];
-    if ($do_inactive && $ci_date !== null) $chips[] = ['<strong>' . count($inactive) . '</strong> לא פעילים (מעל ' . $inactive_months . ' חודשים)', '#f3e5f5', '#9c27b0'];
+    if ($do_inactive && $ci_date !== null) {
+        $chips[] = ['<strong>' . count($inactive) . '</strong> לא פעילים (מעל ' . $inactive_months . ' חודשים)', '#f3e5f5', '#9c27b0'];
+        if ($to_restore) $chips[] = ['<strong>' . count($to_restore) . '</strong> מוסתרים לשחזור', '#e8f5e9', '#4caf50'];
+    }
     echo '<div style="display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap">';
     foreach ($chips as [$label, $bg, $border])
         echo '<span style="background:' . $bg . ';border:1px solid ' . $border . ';border-radius:8px;padding:8px 16px;font-size:14px">' . $label . '</span>';
@@ -849,19 +880,33 @@ function shpk_prices_page() {
         echo '</tbody></table>';
     }
 
-    if ($inactive) {
-        echo '<h3 style="margin-top:28px">😴 מוצרים לא פעילים — לא נמכרו מעל ' . $inactive_months . ' חודשים (' . count($inactive) . ')</h3>';
-        echo '<p style="color:#555">ניתן להסתיר אותם מהקטלוג. הם ישארו ב-WooCommerce אך לא יופיעו בחנות.</p>';
-        echo '<form method="post" style="margin-bottom:16px">';
+    if ($inactive || $to_restore) {
+        echo '<form method="post" style="margin-top:28px;margin-bottom:8px">';
         wp_nonce_field('shpk_hide_inactive');
         echo '<input type="hidden" name="shpk_hide_inactive" value="1">';
-        submit_button('🙈 הסתר ' . count($inactive) . ' מוצרים מהקטלוג', 'delete large', '', false, ['style' => 'font-size:15px']);
+        $btn_parts = [];
+        if ($inactive)   $btn_parts[] = '🙈 הסתר ' . count($inactive);
+        if ($to_restore) $btn_parts[] = '👁 שחזר ' . count($to_restore);
+        submit_button(implode(' | ', $btn_parts) . ' מוצרים', 'primary large', '', false, ['style' => 'font-size:15px']);
         echo '</form>';
+    }
+    if ($inactive) {
+        echo '<h3 style="margin-top:20px">😴 מוצרים לא פעילים — לא נמכרו מעל ' . $inactive_months . ' חודשים (' . count($inactive) . ')</h3>';
+        echo '<p style="color:#555">יוסתרו מהקטלוג — ישארו ב-WooCommerce אך לא יופיעו בחנות.</p>';
         echo '<table class="wp-list-table widefat fixed striped"><thead><tr><th>מוצר</th><th style="width:160px">ברקוד</th><th style="width:130px">נמכר לאחרונה</th></tr></thead><tbody>';
         foreach ($inactive as $u)
             echo '<tr><td>' . esc_html($u['name']) . '</td><td>' . esc_html($u['sku']) . '</td><td>' . esc_html($u['last_sale']) . '</td></tr>';
         echo '</tbody></table>';
     }
+    if ($to_restore) {
+        echo '<h3 style="margin-top:28px">✅ מוצרים מוסתרים לשחזור — נמכרו לאחרונה (' . count($to_restore) . ')</h3>';
+        echo '<p style="color:#555">מוצרים אלו מוסתרים כרגע אך יש להם מכירה עדכנית — יוחזרו לתצוגה בקטלוג.</p>';
+        echo '<table class="wp-list-table widefat fixed striped"><thead><tr><th>מוצר</th><th style="width:160px">ברקוד</th><th style="width:130px">נמכר לאחרונה</th></tr></thead><tbody>';
+        foreach ($to_restore as $u)
+            echo '<tr><td>' . esc_html($u['name']) . '</td><td>' . esc_html($u['sku']) . '</td><td>' . esc_html($u['last_sale']) . '</td></tr>';
+        echo '</tbody></table>';
+    }
+} // shpk_prices_page()
 
 /* ── CSS ─────────────────────────────────────────────── */
 function shpk_css() { ?>
