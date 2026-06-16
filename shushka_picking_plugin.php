@@ -415,7 +415,7 @@ function shpk_prices_page() {
         FROM {$wpdb->posts} p
         JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = '_sku'
         WHERE p.post_type IN ('product','product_variation')
-          AND p.post_status = 'publish' AND pm.meta_value != ''
+          AND p.post_status NOT IN ('trash','auto-draft') AND pm.meta_value != ''
     ");
     $wc_map = [];
     foreach ($rows as $r) {
