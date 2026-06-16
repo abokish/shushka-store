@@ -446,16 +446,15 @@ function shpk_prices_page() {
 
     // ── ייצוא מוצרים חסרים ───────────────────────────────
     if (isset($_GET['action']) && $_GET['action'] === 'export_missing') {
-        $tkey = sanitize_key($_GET['tkey'] ?? '');
-        $data = $tkey ? get_transient('shpk_pu_' . $tkey) : null;
-        if (!$data || empty($data['not_in_wc'])) wp_die('אין נתונים — טען שוב את קובץ הקופה.');
+        $missing = get_transient('shpk_missing_products');
+        if (!$missing) wp_die('אין נתונים — טען שוב את קובץ הקופה.');
         header('Content-Type: text/csv; charset=utf-8');
         header('Content-Disposition: attachment; filename="missing-products-' . date('Ymd') . '.csv"');
         header('Pragma: no-cache');
         $out = fopen('php://output', 'w');
         fputs($out, "\xEF\xBB\xBF");
         fputcsv($out, ['ברקוד', 'שם', 'מחיר']);
-        foreach ($data['not_in_wc'] as $u)
+        foreach ($missing as $u)
             fputcsv($out, [$u['sku'], $u['name'], $u['price'] ?? '']);
         fclose($out);
         exit;
@@ -555,6 +554,15 @@ function shpk_prices_page() {
             $n = (int)get_transient('shpk_sku_fix_result');
             delete_transient('shpk_sku_fix_result');
             echo '<div class="notice notice-success is-dismissible"><p>✓ תוקנו ' . $n . ' ברקודים — הוסרה סיומת .0</p></div>';
+        }
+
+        // missing products export button
+        $missing = get_transient('shpk_missing_products');
+        if ($missing) {
+            echo '<div style="background:#e8f4fd;border:1px solid #2196f3;border-radius:8px;padding:16px 20px;margin-bottom:20px;display:flex;align-items:center;gap:20px;flex-wrap:wrap">';
+            echo '<span><strong>' . count($missing) . ' מוצרים</strong> בקופה שאינם באתר</span>';
+            echo '<a href="' . admin_url('admin.php?page=shushka-prices&action=export_missing') . '" class="button button-primary">⬇ ייצא CSV של מוצרים חסרים</a>';
+            echo '</div>';
         }
 
         // sku cleanup button
@@ -697,6 +705,8 @@ function shpk_prices_page() {
         'stock_zero' => $stock_zero,
         'not_in_wc'  => $not_in_wc,
     ], MINUTE_IN_SECONDS * 30);
+    // שמור חסרים בנפרד ל-24 שעות (גם אחרי אישור עדכון)
+    if ($not_in_wc) set_transient('shpk_missing_products', $not_in_wc, DAY_IN_SECONDS);
 
     // ── preview UI ───────────────────────────────────────
     $total_changes = count($price_changes) + count($stock_changes);
@@ -764,7 +774,7 @@ function shpk_prices_page() {
     if ($not_in_wc) {
         echo '<h3 style="margin-top:28px">🆕 בקופה אך לא באתר (' . count($not_in_wc) . ')</h3>';
         echo '<p style="color:#555">מוצרים אלו קיימים בקופה אך לא ב-WooCommerce. ניתן לייצא אותם ולייבא עם הסקריפט.</p>';
-        echo '<a href="' . admin_url('admin.php?page=shushka-prices&action=export_missing&tkey=' . urlencode($tkey)) . '" class="button button-primary" style="margin-bottom:16px">⬇ ייצא CSV של מוצרים חסרים</a>';
+        echo '<a href="' . admin_url('admin.php?page=shushka-prices&action=export_missing') . '" class="button button-primary" style="margin-bottom:16px">⬇ ייצא CSV של מוצרים חסרים</a>';
         echo '<table class="wp-list-table widefat fixed striped"><thead><tr><th>שם</th><th>ברקוד</th><th>מחיר</th></tr></thead><tbody>';
         foreach ($not_in_wc as $u)
             echo '<tr><td>' . esc_html($u['name']) . '</td><td>' . esc_html($u['sku']) . '</td><td>₪' . number_format($u['price'] ?? 0, 2) . '</td></tr>';
