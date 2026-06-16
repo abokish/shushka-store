@@ -195,14 +195,14 @@ add_action('admin_init', function() {
     check_admin_referer('shpk_fix_skus');
     global $wpdb;
     $rows = $wpdb->get_results(
-        "SELECT post_id, meta_value FROM {$wpdb->postmeta}
-         WHERE meta_key='_sku' AND meta_value REGEXP '^[0-9]+\\.0+$'"
+        "SELECT meta_id, meta_value FROM {$wpdb->postmeta}
+         WHERE meta_key='_sku' AND meta_value LIKE '%.0'"
     );
     $fixed = 0;
     foreach ($rows as $r) {
         $clean = preg_replace('/\.0+$/', '', $r->meta_value);
-        $wpdb->update($wpdb->postmeta, ['meta_value' => $clean],
-                      ['post_id' => $r->post_id, 'meta_key' => '_sku']);
+        if ($clean === $r->meta_value) continue;
+        $wpdb->update($wpdb->postmeta, ['meta_value' => $clean], ['meta_id' => $r->meta_id]);
         $fixed++;
     }
     set_transient('shpk_sku_fix_result', $fixed, MINUTE_IN_SECONDS * 5);
@@ -330,7 +330,7 @@ function shpk_prices_page() {
         // sku cleanup button
         global $wpdb;
         $dirty = (int)$wpdb->get_var(
-            "SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key='_sku' AND meta_value REGEXP '^[0-9]+\\.0+$'"
+            "SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key='_sku' AND meta_value LIKE '%.0'"
         );
         if ($dirty > 0) {
             echo '<div style="background:#fff3e0;border:1px solid #ff9800;border-radius:8px;padding:16px 20px;margin-bottom:20px">';
