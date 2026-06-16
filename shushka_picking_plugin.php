@@ -352,7 +352,7 @@ function shpk_prices_page() {
     foreach ($lines as $line) {
         if (!trim($line)) continue;
         $c     = str_getcsv($line);
-        $sku   = trim($c[$ci_sku] ?? '');
+        $sku   = preg_replace('/\.0+$/', '', trim($c[$ci_sku] ?? ''));
         if ($sku === '') continue;
         $price = $ci_price !== null ? (float)str_replace([',', ' '], ['.', ''], trim($c[$ci_price] ?? '')) : null;
         $stock = $ci_stock !== null ? (int)trim($c[$ci_stock] ?? '') : null;
@@ -375,7 +375,10 @@ function shpk_prices_page() {
           AND p.post_status = 'publish' AND pm.meta_value != ''
     ");
     $wc_map = [];
-    foreach ($rows as $r) $wc_map[$r->sku] = (int)$r->ID;
+    foreach ($rows as $r) {
+        $s = preg_replace('/\.0+$/', '', trim($r->sku)); // strip Excel .0 suffix
+        $wc_map[$s] = (int)$r->ID;
+    }
 
     // ── match & build lists ──────────────────────────────
     @set_time_limit(300);
