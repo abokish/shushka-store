@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Shushka Likut
  * Description: ליקוט ומשלוח הזמנות — שושקה
- * Version: 4.6.0
+ * Version: 4.7.0
  */
 defined('ABSPATH') || exit;
 
@@ -200,6 +200,8 @@ add_action('admin_menu', function () {
         'manage_woocommerce', 'shushka-deliver', 'shpk_deliver_page');
     add_submenu_page('shushka-pick', 'הגדרות PIN', '⚙️ קוד PIN',
         'manage_woocommerce', 'shushka-pin', 'shpk_pin_settings');
+    add_submenu_page('shushka-pick', 'עדכון מחירים', '📊 מחירים',
+        'manage_woocommerce', 'shushka-prices', 'shpk_prices_page');
     add_submenu_page('shushka-pick', 'עדכון תוסף', '🔄 עדכון',
         'manage_options', 'shushka-update', 'shpk_update_page');
 });
@@ -223,6 +225,187 @@ function shpk_pin_settings() {
     echo '<input type="hidden" name="shushka_save_pin" value="1">';
     submit_button('שמור קוד');
     echo '</form></div>';
+}
+
+/* ── עדכון מחירים ───────────────────────────────────── */
+add_action('admin_init', function() {
+    if (!isset($_POST['shpk_prices_apply']) || !current_user_can('manage_woocommerce')) return;
+    check_admin_referer('shpk_prices_apply');
+    $tkey   = sanitize_key($_POST['shpk_tkey'] ?? '');
+    $updates = $tkey ? get_transient('shpk_pu_' . $tkey) : null;
+    if (!$updates) { wp_redirect(admin_url('admin.php?page=shushka-prices&err=expired')); exit; }
+
+    @set_time_limit(300);
+    $done = 0; $fail = [];
+    foreach ($updates as $u) {
+        $product = wc_get_product($u['id']);
+        if (!$product) { $fail[] = $u['name']; continue; }
+        $product->set_regular_price($u['new_price']);
+        // Clear sale price so regular price takes effect
+        $product->set_sale_price('');
+        $product->set_price($u['new_price']);
+        $product->save();
+        $done++;
+    }
+    delete_transient('shpk_pu_' . $tkey);
+    set_transient('shpk_pr_result', ['done' => $done, 'fail' => $fail], MINUTE_IN_SECONDS * 5);
+    wp_redirect(admin_url('admin.php?page=shushka-prices&done=1'));
+    exit;
+});
+
+function shpk_prices_page() {
+    if (!current_user_can('manage_woocommerce')) wp_die('אין הרשאה');
+
+    // ── after apply redirect ────────────────────────────
+    if (isset($_GET['done'])) {
+        $r = get_transient('shpk_pr_result');
+        delete_transient('shpk_pr_result');
+        echo '<div class="wrap" dir="rtl"><h1>📊 עדכון מחירים</h1>';
+        if ($r) {
+            echo '<div class="notice notice-success is-dismissible"><p>✓ עודכנו ' . $r['done'] . ' מוצרים בהצלחה.</p></div>';
+            if ($r['fail']) {
+                echo '<div class="notice notice-warning"><p>⚠ ' . count($r['fail']) . ' מוצרים נכשלו:</p><ul>';
+                foreach ($r['fail'] as $n) echo '<li>' . esc_html($n) . '</li>';
+                echo '</ul></div>';
+            }
+        }
+        echo '<p><a href="' . admin_url('admin.php?page=shushka-prices') . '" class="button button-primary">⬆ העלאה נוספת</a></p></div>';
+        return;
+    }
+    if (isset($_GET['err'])) {
+        echo '<div class="wrap" dir="rtl"><h1>📊 עדכון מחירים</h1>';
+        echo '<div class="notice notice-error"><p>שגיאה: פג תוקף הנתונים — אנא העלה שוב.</p></div>';
+        echo '<p><a href="' . admin_url('admin.php?page=shushka-prices') . '" class="button">חזרה</a></p></div>';
+        return;
+    }
+
+    // ── upload form ─────────────────────────────────────
+    if (!isset($_POST['shpk_prices_preview'])) {
+        echo '<div class="wrap" dir="rtl"><h1>📊 עדכון מחירים מהקופה</h1>';
+        echo '<p>העלה את קובץ הייצוא מהקופה. ההתאמה לפי <strong>ברקוד ↔ SKU</strong>, המחיר מעמודת <strong>מחיר מכירה</strong>.</p>';
+        echo '<form method="post" enctype="multipart/form-data">';
+        wp_nonce_field('shpk_prices_preview');
+        echo '<input type="hidden" name="shpk_prices_preview" value="1">';
+        echo '<input type="file" name="shpk_csv" accept=".csv" required style="margin:12px 0;display:block;font-size:15px">';
+        submit_button('📋 טען ותצוגה מקדימה', 'primary large');
+        echo '</form></div>';
+        return;
+    }
+
+    // ── parse CSV ────────────────────────────────────────
+    check_admin_referer('shpk_prices_preview');
+    $tmp = $_FILES['shpk_csv']['tmp_name'] ?? '';
+    if (!$tmp) { echo '<div class="wrap" dir="rtl"><p class="error">לא נבחר קובץ.</p></div>'; return; }
+
+    $raw     = file_get_contents($tmp);
+    $raw     = ltrim($raw, "\xEF\xBB\xBF");
+    $lines   = explode("\n", str_replace(["\r\n", "\r"], "\n", trim($raw)));
+    $headers = str_getcsv(array_shift($lines));
+
+    $ci_sku = $ci_price = $ci_name = null;
+    foreach ($headers as $i => $h) {
+        $h = trim($h);
+        if (mb_strpos($h, 'ברקוד')       !== false) $ci_sku   = $i;
+        if (mb_strpos($h, 'מחיר מכירה') !== false) $ci_price = $i;
+        if (mb_strpos($h, 'תאור')        !== false) $ci_name  = $i;
+    }
+    if ($ci_sku === null || $ci_price === null) {
+        echo '<div class="wrap" dir="rtl"><h1>📊 עדכון מחירים</h1>';
+        echo '<p style="color:red">לא נמצאו עמודות ברקוד / מחיר מכירה. בדוק את הקובץ.</p></div>'; return;
+    }
+
+    $csv = [];
+    foreach ($lines as $line) {
+        if (!trim($line)) continue;
+        $c = str_getcsv($line);
+        $sku   = trim($c[$ci_sku]   ?? '');
+        $price = (float) str_replace([',', ' '], ['.', ''], trim($c[$ci_price] ?? ''));
+        $name  = trim($c[$ci_name]  ?? '');
+        if ($sku !== '' && $price > 0) $csv[$sku] = ['name' => $name, 'price' => $price];
+    }
+    if (!$csv) {
+        echo '<div class="wrap" dir="rtl"><h1>📊 עדכון מחירים</h1><p style="color:red">לא נמצאו שורות תקינות.</p></div>'; return;
+    }
+
+    // ── build WC SKU→ID map from DB (fast) ───────────────
+    global $wpdb;
+    $rows = $wpdb->get_results("
+        SELECT p.ID, pm.meta_value AS sku
+        FROM {$wpdb->posts} p
+        JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = '_sku'
+        WHERE p.post_type IN ('product','product_variation')
+          AND p.post_status = 'publish'
+          AND pm.meta_value != ''
+    ");
+    $wc_map = [];
+    foreach ($rows as $r) $wc_map[$r->sku] = (int)$r->ID;
+
+    // ── match ────────────────────────────────────────────
+    $to_update = []; $not_in_wc = []; $no_change = 0;
+    foreach ($csv as $sku => $d) {
+        if (!isset($wc_map[$sku])) { $not_in_wc[] = $d + ['sku' => $sku]; continue; }
+        $product   = wc_get_product($wc_map[$sku]);
+        if (!$product) { $not_in_wc[] = $d + ['sku' => $sku]; continue; }
+        $old = (float)$product->get_regular_price();
+        if (abs($old - $d['price']) < 0.001) { $no_change++; continue; }
+        $to_update[] = ['id' => $wc_map[$sku], 'sku' => $sku,
+                        'name' => $product->get_name(), 'old_price' => $old, 'new_price' => $d['price']];
+    }
+    $not_in_csv = count($wc_map) - count($csv) + count($not_in_wc); // approx
+
+    // Store for apply step
+    $tkey = wp_generate_password(16, false);
+    set_transient('shpk_pu_' . $tkey, $to_update, MINUTE_IN_SECONDS * 30);
+
+    // ── preview UI ───────────────────────────────────────
+    echo '<div class="wrap" dir="rtl"><h1>📊 תצוגה מקדימה — עדכון מחירים</h1>';
+    echo '<div style="display:flex;gap:24px;margin-bottom:16px;flex-wrap:wrap">';
+    echo '<span style="background:#e8f5e9;border:1px solid #4caf50;border-radius:8px;padding:10px 20px;font-size:15px"><strong>' . count($to_update) . '</strong> מוצרים ישתנו</span>';
+    echo '<span style="background:#f5f5f5;border:1px solid #ccc;border-radius:8px;padding:10px 20px;font-size:15px"><strong>' . $no_change . '</strong> ללא שינוי</span>';
+    echo '<span style="background:#fff8e1;border:1px solid #ff9800;border-radius:8px;padding:10px 20px;font-size:15px"><strong>' . count($not_in_wc) . '</strong> לא נמצאו באתר</span>';
+    echo '</div>';
+
+    if ($to_update) {
+        echo '<form method="post" style="margin-bottom:20px">';
+        wp_nonce_field('shpk_prices_apply');
+        echo '<input type="hidden" name="shpk_prices_apply" value="1">';
+        echo '<input type="hidden" name="shpk_tkey" value="' . esc_attr($tkey) . '">';
+        submit_button('✓ אשר ועדכן ' . count($to_update) . ' מוצרים', 'primary large', '', false,
+                      ['style' => 'font-size:16px;padding:8px 28px']);
+        echo ' &nbsp;<a href="' . admin_url('admin.php?page=shushka-prices') . '" class="button button-large">ביטול</a>';
+        echo '</form>';
+
+        echo '<table class="wp-list-table widefat fixed striped">';
+        echo '<thead><tr><th>מוצר</th><th style="width:140px">ברקוד</th><th style="width:110px">מחיר ישן</th><th style="width:110px">מחיר חדש</th><th style="width:60px"></th></tr></thead><tbody>';
+        foreach ($to_update as $u) {
+            $up   = $u['new_price'] > $u['old_price'];
+            $arr  = $up ? '▲' : '▼';
+            $col  = $up ? '#c00' : '#080';
+            echo '<tr>';
+            echo '<td>' . esc_html($u['name']) . '</td>';
+            echo '<td>' . esc_html($u['sku']) . '</td>';
+            echo '<td>₪' . number_format($u['old_price'], 2) . '</td>';
+            echo '<td><strong>₪' . number_format($u['new_price'], 2) . '</strong></td>';
+            echo '<td style="color:' . $col . ';font-weight:700">' . $arr . '</td>';
+            echo '</tr>';
+        }
+        echo '</tbody></table>';
+    } else {
+        echo '<div class="notice notice-success"><p>✓ כל המחירים עדכניים — אין מה לשנות.</p></div>';
+    }
+
+    if ($not_in_wc) {
+        echo '<h3 style="margin-top:28px">⚠ ' . count($not_in_wc) . ' מוצרים בקופה שלא נמצאו באתר</h3>';
+        echo '<p style="color:#666">אלו ככל הנראה מוצרים חדשים שטרם נוספו ל-WooCommerce.</p>';
+        echo '<table class="wp-list-table widefat fixed striped">';
+        echo '<thead><tr><th>שם בקופה</th><th>ברקוד</th><th>מחיר בקופה</th></tr></thead><tbody>';
+        foreach ($not_in_wc as $u) {
+            echo '<tr><td>' . esc_html($u['name']) . '</td><td>' . esc_html($u['sku']) . '</td><td>₪' . number_format($u['price'], 2) . '</td></tr>';
+        }
+        echo '</tbody></table>';
+    }
+
+    echo '</div>';
 }
 
 /* ── CSS ─────────────────────────────────────────────── */
