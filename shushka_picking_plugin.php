@@ -255,6 +255,51 @@ function shpk_prices_page() {
 
     $base = admin_url('admin.php?page=shushka-prices');
 
+    // ── אבחון SKU ────────────────────────────────────────
+    if (isset($_GET['action']) && $_GET['action'] === 'diag_sku') {
+        global $wpdb;
+        $sku = sanitize_text_field($_GET['sku'] ?? '');
+        echo '<div class="wrap" dir="rtl"><h1>🔍 אבחון SKU</h1>';
+        if ($sku) {
+            echo '<p>מחפש: <strong>' . esc_html($sku) . '</strong></p>';
+            $rows = $wpdb->get_results($wpdb->prepare("
+                SELECT p.ID, p.post_title, p.post_status, p.post_type, pm.meta_value AS sku
+                FROM {$wpdb->posts} p
+                JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = '_sku'
+                WHERE pm.meta_value = %s OR pm.meta_value = %s
+            ", $sku, $sku . '.0'));
+            if ($rows) {
+                echo '<table class="wp-list-table widefat fixed striped"><thead><tr><th>ID</th><th>שם</th><th>סטטוס</th><th>סוג</th><th>SKU בDB</th></tr></thead><tbody>';
+                foreach ($rows as $r)
+                    echo '<tr><td>' . $r->ID . '</td><td>' . esc_html($r->post_title) . '</td><td>' . $r->post_status . '</td><td>' . $r->post_type . '</td><td>' . esc_html($r->sku) . '</td></tr>';
+                echo '</tbody></table>';
+            } else {
+                echo '<div class="notice notice-error"><p>❌ לא נמצא שום מוצר עם SKU זה בבסיס הנתונים.</p></div>';
+            }
+            // also show total counts by status
+            $counts = $wpdb->get_results("
+                SELECT p.post_status, p.post_type, COUNT(*) as cnt
+                FROM {$wpdb->posts} p
+                JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = '_sku' AND pm.meta_value != ''
+                WHERE p.post_type IN ('product','product_variation')
+                GROUP BY p.post_status, p.post_type ORDER BY cnt DESC
+            ");
+            echo '<h3 style="margin-top:24px">סה"כ מוצרים עם SKU לפי סטטוס</h3>';
+            echo '<table class="wp-list-table widefat fixed striped"><thead><tr><th>סטטוס</th><th>סוג</th><th>כמות</th></tr></thead><tbody>';
+            foreach ($counts as $c)
+                echo '<tr><td>' . $c->post_status . '</td><td>' . $c->post_type . '</td><td>' . $c->cnt . '</td></tr>';
+            echo '</tbody></table>';
+        }
+        echo '<form method="get" style="margin-top:20px">';
+        echo '<input type="hidden" name="page" value="shushka-prices">';
+        echo '<input type="hidden" name="action" value="diag_sku">';
+        echo '<input type="text" name="sku" value="' . esc_attr($sku) . '" placeholder="הכנס ברקוד לחיפוש" style="width:240px;font-size:15px">';
+        echo ' <button type="submit" class="button button-primary">חפש</button>';
+        echo '</form>';
+        echo '<p style="margin-top:16px"><a href="' . admin_url('admin.php?page=shushka-prices') . '" class="button">חזרה</a></p></div>';
+        return;
+    }
+
     // ── ייצוא הזמנות נארזות ─────────────────────────────
     if (isset($_GET['action']) && $_GET['action'] === 'export_packed') {
         $pin    = get_option('shushka_pick_pin', '1234');
