@@ -444,6 +444,23 @@ function shpk_prices_page() {
         exit;
     }
 
+    // ── ייצוא מוצרים חסרים ───────────────────────────────
+    if (isset($_GET['action']) && $_GET['action'] === 'export_missing') {
+        $tkey = sanitize_key($_GET['tkey'] ?? '');
+        $data = $tkey ? get_transient('shpk_pu_' . $tkey) : null;
+        if (!$data || empty($data['not_in_wc'])) wp_die('אין נתונים — טען שוב את קובץ הקופה.');
+        header('Content-Type: text/csv; charset=utf-8');
+        header('Content-Disposition: attachment; filename="missing-products-' . date('Ymd') . '.csv"');
+        header('Pragma: no-cache');
+        $out = fopen('php://output', 'w');
+        fputs($out, "\xEF\xBB\xBF");
+        fputcsv($out, ['ברקוד', 'שם', 'מחיר']);
+        foreach ($data['not_in_wc'] as $u)
+            fputcsv($out, [$u['sku'], $u['name'], $u['price'] ?? '']);
+        fclose($out);
+        exit;
+    }
+
     // ── מיגרציית SKU: תצוגה מקדימה ──────────────────────
     if (isset($_GET['action']) && $_GET['action'] === 'migrate_preview') {
         $tkey = sanitize_key($_GET['tkey'] ?? '');
@@ -678,6 +695,7 @@ function shpk_prices_page() {
         'prices'     => $price_changes,
         'stocks'     => $stock_changes,
         'stock_zero' => $stock_zero,
+        'not_in_wc'  => $not_in_wc,
     ], MINUTE_IN_SECONDS * 30);
 
     // ── preview UI ───────────────────────────────────────
@@ -745,6 +763,8 @@ function shpk_prices_page() {
 
     if ($not_in_wc) {
         echo '<h3 style="margin-top:28px">🆕 בקופה אך לא באתר (' . count($not_in_wc) . ')</h3>';
+        echo '<p style="color:#555">מוצרים אלו קיימים בקופה אך לא ב-WooCommerce. ניתן לייצא אותם ולייבא עם הסקריפט.</p>';
+        echo '<a href="' . admin_url('admin.php?page=shushka-prices&action=export_missing&tkey=' . urlencode($tkey)) . '" class="button button-primary" style="margin-bottom:16px">⬇ ייצא CSV של מוצרים חסרים</a>';
         echo '<table class="wp-list-table widefat fixed striped"><thead><tr><th>שם</th><th>ברקוד</th><th>מחיר</th></tr></thead><tbody>';
         foreach ($not_in_wc as $u)
             echo '<tr><td>' . esc_html($u['name']) . '</td><td>' . esc_html($u['sku']) . '</td><td>₪' . number_format($u['price'] ?? 0, 2) . '</td></tr>';
