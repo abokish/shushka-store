@@ -189,6 +189,60 @@ function shpk_pin_settings() {
     echo '</form></div>';
 }
 
+/* ── ייצוא CSV — admin_init (לפני פלט HTML) ─────────── */
+add_action('admin_init', function() {
+    if ((($_GET['page'] ?? '') !== 'shushka-prices') || !isset($_GET['action'])) return;
+    if (!current_user_can('manage_woocommerce')) return;
+
+    $action = $_GET['action'];
+
+    // ייצוא מוצרים חסרים
+    if ($action === 'export_missing') {
+        $missing = get_transient('shpk_missing_products');
+        if (!$missing) wp_die('אין נתונים — טען שוב את קובץ הקופה כדי לרענן את הרשימה.');
+        header('Content-Type: text/csv; charset=utf-8');
+        header('Content-Disposition: attachment; filename="missing-products-' . date('Ymd') . '.csv"');
+        header('Pragma: no-cache');
+        $out = fopen('php://output', 'w');
+        fputs($out, "\xEF\xBB\xBF");
+        fputcsv($out, ['ברקוד', 'שם', 'מחיר']);
+        foreach ($missing as $u)
+            fputcsv($out, [$u['sku'], $u['name'], $u['price'] ?? '']);
+        fclose($out);
+        exit;
+    }
+
+    // ייצוא הזמנות נארזות
+    if ($action === 'export_packed') {
+        $pin    = get_option('shushka_pick_pin', '1234');
+        $pin_ok = isset($_COOKIE['shushka_pin']) && $_COOKIE['shushka_pin'] === md5($pin . AUTH_KEY);
+        if (!$pin_ok && !current_user_can('manage_woocommerce')) wp_die('אין הרשאה');
+        $orders = wc_get_orders(['status' => ['packed'], 'limit' => -1, 'orderby' => 'date', 'order' => 'ASC']);
+        header('Content-Type: text/csv; charset=utf-8');
+        header('Content-Disposition: attachment; filename="shushka-packed-' . date('Ymd-His') . '.csv"');
+        header('Pragma: no-cache');
+        $out = fopen('php://output', 'w');
+        fputs($out, "\xEF\xBB\xBF");
+        fputcsv($out, ['מספר הזמנה', 'שם לקוח', 'ברקוד', 'שם מוצר', 'כמות', 'מחיר ליחידה', 'סה"כ שורה']);
+        $seq = 0;
+        foreach ($orders as $order) {
+            $seq++;
+            $cname = trim($order->get_billing_first_name() . ' ' . $order->get_billing_last_name());
+            foreach ($order->get_items() as $item) {
+                $product    = $item->get_product();
+                $sku        = $product ? $product->get_sku() : '';
+                $qty        = $item->get_quantity();
+                $unit_price = $qty > 0 ? round($item->get_total() / $qty, 2) : 0;
+                fputcsv($out, [$seq, $cname, $sku, $item->get_name(), $qty,
+                               number_format((float)$unit_price, 2, '.', ''),
+                               number_format((float)$item->get_total(), 2, '.', '')]);
+            }
+        }
+        fclose($out);
+        exit;
+    }
+});
+
 /* ── מיגרציית SKU: קוד פריט → ברקוד (תצוגה מקדימה) ─── */
 add_action('admin_init', function() {
     if (!isset($_POST['shpk_sku_migrate_preview']) || !current_user_can('manage_woocommerce')) return;
@@ -412,52 +466,6 @@ function shpk_prices_page() {
         echo '</form>';
         echo '<p style="margin-top:16px"><a href="' . admin_url('admin.php?page=shushka-prices') . '" class="button">חזרה</a></p></div>';
         return;
-    }
-
-    // ── ייצוא הזמנות נארזות ─────────────────────────────
-    if (isset($_GET['action']) && $_GET['action'] === 'export_packed') {
-        $pin    = get_option('shushka_pick_pin', '1234');
-        $pin_ok = isset($_COOKIE['shushka_pin']) && $_COOKIE['shushka_pin'] === md5($pin . AUTH_KEY);
-        if (!$pin_ok && !current_user_can('manage_woocommerce')) wp_die('אין הרשאה');
-        $orders = wc_get_orders(['status' => ['packed'], 'limit' => -1, 'orderby' => 'date', 'order' => 'ASC']);
-        header('Content-Type: text/csv; charset=utf-8');
-        header('Content-Disposition: attachment; filename="shushka-packed-' . date('Ymd-His') . '.csv"');
-        header('Pragma: no-cache');
-        $out = fopen('php://output', 'w');
-        fputs($out, "\xEF\xBB\xBF");
-        fputcsv($out, ['מספר הזמנה', 'שם לקוח', 'ברקוד', 'שם מוצר', 'כמות', 'מחיר ליחידה', 'סה"כ שורה']);
-        $seq = 0;
-        foreach ($orders as $order) {
-            $seq++;
-            $cname = trim($order->get_billing_first_name() . ' ' . $order->get_billing_last_name());
-            foreach ($order->get_items() as $item) {
-                $product    = $item->get_product();
-                $sku        = $product ? $product->get_sku() : '';
-                $qty        = $item->get_quantity();
-                $unit_price = $qty > 0 ? round($item->get_total() / $qty, 2) : 0;
-                fputcsv($out, [$seq, $cname, $sku, $item->get_name(), $qty,
-                               number_format((float)$unit_price, 2, '.', ''),
-                               number_format((float)$item->get_total(), 2, '.', '')]);
-            }
-        }
-        fclose($out);
-        exit;
-    }
-
-    // ── ייצוא מוצרים חסרים ───────────────────────────────
-    if (isset($_GET['action']) && $_GET['action'] === 'export_missing') {
-        $missing = get_transient('shpk_missing_products');
-        if (!$missing) wp_die('אין נתונים — טען שוב את קובץ הקופה.');
-        header('Content-Type: text/csv; charset=utf-8');
-        header('Content-Disposition: attachment; filename="missing-products-' . date('Ymd') . '.csv"');
-        header('Pragma: no-cache');
-        $out = fopen('php://output', 'w');
-        fputs($out, "\xEF\xBB\xBF");
-        fputcsv($out, ['ברקוד', 'שם', 'מחיר']);
-        foreach ($missing as $u)
-            fputcsv($out, [$u['sku'], $u['name'], $u['price'] ?? '']);
-        fclose($out);
-        exit;
     }
 
     // ── מיגרציית SKU: תצוגה מקדימה ──────────────────────
