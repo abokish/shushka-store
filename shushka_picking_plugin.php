@@ -1,6 +1,6 @@
 <?php
 /**
- * Plugin Name: Shushka Likut
+ * Plugin Name: שושקה — ניהול חנות
  * Description: ליקוט ומשלוח הזמנות — שושקה
  * Version: 4.8.0
  */
@@ -154,7 +154,7 @@ function shpk_update_page() {
 
 /* ── תפריט ───────────────────────────────────────────── */
 add_action('admin_menu', function () {
-    add_menu_page('ליקוט', '📦 ליקוט', 'manage_woocommerce',
+    add_menu_page('שושקה', '📦 שושקה', 'manage_woocommerce',
         'shushka-pick', 'shpk_pick_page', 'dashicons-clipboard', 55);
     add_submenu_page('shushka-pick', 'ליקוט הזמנות', '📦 ליקוט',
         'manage_woocommerce', 'shushka-pick', 'shpk_pick_page');
