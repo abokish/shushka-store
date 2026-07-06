@@ -2,7 +2,7 @@
 /**
  * Plugin Name: שושקה — ניהול חנות
  * Description: ליקוט ומשלוח הזמנות — שושקה
- * Version: 4.8.0
+ * Version: 5.3.2
  */
 defined('ABSPATH') || exit;
 
@@ -243,137 +243,60 @@ add_action('admin_init', function() {
     }
 });
 
-/* ── עדכון נראות מוצרים (הסתר לא פעילים / שחזר פעילים) */
-add_action('admin_init', function() {
-    if (!isset($_POST['shpk_hide_inactive']) || !current_user_can('manage_woocommerce')) return;
-    check_admin_referer('shpk_hide_inactive');
+/* ── AJAX: הסתרה/שחזור מוצרים בבצ'ים ─────────────────── */
+add_action('wp_ajax_shpk_hide_batch', function() {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!current_user_can('manage_woocommerce')) { wp_send_json_error('unauthorized'); return; }
+
     $inactive = get_transient('shpk_inactive_products') ?: [];
     $restore  = get_transient('shpk_restore_products')  ?: [];
-    if (!$inactive && !$restore) { wp_redirect(admin_url('admin.php?page=shushka-prices&err=expired')); exit; }
-    @set_time_limit(300);
+
+    // Build combined list with action flag
+    $all = [];
+    foreach ($inactive as $u) $all[] = ['id' => (int)$u['id'], 'act' => 'hide'];
+    foreach ($restore  as $u) $all[] = ['id' => (int)$u['id'], 'act' => 'restore'];
+
+    $offset   = absint($_POST['offset'] ?? 0);
+    $batch_sz = 15;
+    $total    = count($all);
+
+    if ($offset >= $total) {
+        delete_transient('shpk_inactive_products');
+        delete_transient('shpk_restore_products');
+        wp_send_json_success(['hidden' => 0, 'restored' => 0, 'offset' => $total, 'total' => $total, 'finished' => true]);
+        return;
+    }
+
+    @set_time_limit(120);
     $hidden = $restored = 0;
-    foreach ($inactive as $u) {
-        $product = wc_get_product($u['id']);
+
+    foreach (array_slice($all, $offset, $batch_sz) as $item) {
+        $product = wc_get_product($item['id']);
         if (!$product) continue;
-        $product->set_catalog_visibility('hidden');
+        if ($item['act'] === 'hide') {
+            $product->set_catalog_visibility('hidden');
+            $hidden++;
+        } else {
+            $product->set_catalog_visibility('visible');
+            $restored++;
+        }
         $product->save();
-        $hidden++;
-    }
-    foreach ($restore as $u) {
-        $product = wc_get_product($u['id']);
-        if (!$product) continue;
-        $product->set_catalog_visibility('visible');
-        $product->save();
-        $restored++;
-    }
-    delete_transient('shpk_inactive_products');
-    delete_transient('shpk_restore_products');
-    set_transient('shpk_hide_result', ['hidden' => $hidden, 'restored' => $restored], MINUTE_IN_SECONDS * 5);
-    wp_redirect(admin_url('admin.php?page=shushka-prices&hidden=1'));
-    exit;
-});
-
-/* ── מיגרציית SKU: קוד פריט → ברקוד (תצוגה מקדימה) ─── */
-add_action('admin_init', function() {
-    if (!isset($_POST['shpk_sku_migrate_preview']) || !current_user_can('manage_woocommerce')) return;
-    check_admin_referer('shpk_sku_migrate_preview');
-
-    $tmp = $_FILES['shpk_migrate_csv']['tmp_name'] ?? '';
-    if (!$tmp) { wp_redirect(admin_url('admin.php?page=shushka-prices&migrate_err=nofile')); exit; }
-
-    $raw     = ltrim(file_get_contents($tmp), "\xEF\xBB\xBF");
-    $lines   = explode("\n", str_replace(["\r\n", "\r"], "\n", trim($raw)));
-    $headers = str_getcsv(array_shift($lines));
-
-    $ci_code = $ci_barcode = $ci_name = null;
-    foreach ($headers as $i => $h) {
-        $h = trim($h);
-        if (mb_strpos($h, 'קוד פריט') !== false) $ci_code    = $i;
-        if (mb_strpos($h, 'ברקוד')    !== false) $ci_barcode = $i;
-        if (mb_strpos($h, 'תאור')     !== false) $ci_name    = $i;
-    }
-    if ($ci_code === null || $ci_barcode === null) {
-        wp_redirect(admin_url('admin.php?page=shushka-prices&migrate_err=cols')); exit;
     }
 
-    $csv_map = [];
-    foreach ($lines as $line) {
-        if (!trim($line)) continue;
-        $c       = str_getcsv($line);
-        $code    = trim($c[$ci_code]    ?? '');
-        $barcode = preg_replace('/\.0+$/', '', trim($c[$ci_barcode] ?? ''));
-        $name    = trim($c[$ci_name]    ?? '');
-        if ($code !== '' && strlen($barcode) >= 6 && ctype_digit($barcode))
-            $csv_map[$code] = ['barcode' => $barcode, 'name' => $name];
-    }
-    if (!$csv_map) { wp_redirect(admin_url('admin.php?page=shushka-prices&migrate_err=empty')); exit; }
-
-    global $wpdb;
-    $codes_escaped = implode(',', array_map(function($c) use ($wpdb) {
-        return "'" . esc_sql($c) . "'";
-    }, array_keys($csv_map)));
-
-    $rows = $wpdb->get_results(
-        "SELECT p.ID, p.post_title, pm.meta_id, pm.meta_value AS sku
-         FROM {$wpdb->posts} p
-         JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = '_sku'
-         WHERE p.post_type IN ('product','product_variation')
-           AND p.post_status NOT IN ('trash','auto-draft')
-           AND pm.meta_value IN ($codes_escaped)"
-    );
-
-    // find barcodes already used as SKUs (conflict detection)
-    $all_barcodes = array_map(function($d) { return $d['barcode']; }, $csv_map);
-    $bc_escaped   = implode(',', array_map(function($b) use ($wpdb) {
-        return "'" . esc_sql($b) . "'";
-    }, $all_barcodes));
-    $existing     = $wpdb->get_col(
-        "SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_key='_sku' AND meta_value IN ($bc_escaped)"
-    );
-    $existing_set = array_flip($existing);
-
-    $to_migrate = $conflicts = [];
-    foreach ($rows as $r) {
-        $d = $csv_map[$r->sku] ?? null;
-        if (!$d) continue;
-        $name = $r->post_title ?: $d['name'];
-        if (isset($existing_set[$d['barcode']]))
-            $conflicts[] = ['name' => $name, 'code' => $r->sku, 'barcode' => $d['barcode']];
-        else
-            $to_migrate[] = ['id' => (int)$r->ID, 'meta_id' => (int)$r->meta_id,
-                             'name' => $name, 'old_sku' => $r->sku, 'new_sku' => $d['barcode']];
+    $next = $offset + $batch_sz;
+    $finished = ($next >= $total);
+    if ($finished) {
+        delete_transient('shpk_inactive_products');
+        delete_transient('shpk_restore_products');
     }
 
-    $tkey = wp_generate_password(16, false);
-    set_transient('shpk_migrate_' . $tkey,
-                  ['items' => $to_migrate, 'conflicts' => $conflicts],
-                  MINUTE_IN_SECONDS * 30);
-    wp_redirect(admin_url('admin.php?page=shushka-prices&action=migrate_preview&tkey=' . $tkey));
-    exit;
-});
-
-/* ── מיגרציית SKU: אישור ─────────────────────────────── */
-add_action('admin_init', function() {
-    if (!isset($_POST['shpk_sku_migrate_apply']) || !current_user_can('manage_woocommerce')) return;
-    check_admin_referer('shpk_sku_migrate_apply');
-
-    $tkey = sanitize_key($_POST['shpk_tkey'] ?? '');
-    $data = $tkey ? get_transient('shpk_migrate_' . $tkey) : null;
-    if (!$data) { wp_redirect(admin_url('admin.php?page=shushka-prices&migrate_err=expired')); exit; }
-
-    global $wpdb;
-    @set_time_limit(300);
-    $done = 0;
-    foreach ($data['items'] as $u) {
-        $wpdb->update($wpdb->postmeta, ['meta_value' => $u['new_sku']], ['meta_id' => $u['meta_id']]);
-        wc_delete_product_transients($u['id']);
-        clean_post_cache($u['id']);
-        $done++;
-    }
-    delete_transient('shpk_migrate_' . $tkey);
-    set_transient('shpk_migrate_result', $done, MINUTE_IN_SECONDS * 5);
-    wp_redirect(admin_url('admin.php?page=shushka-prices&migrate_done=1'));
-    exit;
+    wp_send_json_success([
+        'hidden'   => $hidden,
+        'restored' => $restored,
+        'offset'   => min($next, $total),
+        'total'    => $total,
+        'finished' => $finished,
+    ]);
 });
 
 /* ── ניקוי ברקודים חד-פעמי ──────────────────────────── */
@@ -407,14 +330,23 @@ add_action('admin_init', function() {
 
     @set_time_limit(300);
     $price_done = $stock_done = 0; $fail = [];
+    global $wpdb;
 
     foreach ($data['prices'] ?? [] as $u) {
-        $product = wc_get_product($u['id']);
-        if (!$product) { $fail[] = $u['name']; continue; }
-        $product->set_regular_price($u['new_price']);
-        $product->set_sale_price('');
-        $product->set_price($u['new_price']);
-        $product->save();
+        $pid   = (int)$u['id'];
+        $price = (string)$u['new_price'];
+        if (!get_post($pid)) { $fail[] = $u['name']; continue; }
+        update_post_meta($pid, '_regular_price',        $price);
+        update_post_meta($pid, '_sale_price',           '');
+        update_post_meta($pid, '_sale_price_dates_from','');
+        update_post_meta($pid, '_sale_price_dates_to',  '');
+        update_post_meta($pid, '_price',                $price);
+        $wpdb->update(
+            $wpdb->prefix . 'wc_product_meta_lookup',
+            ['min_price' => $price, 'max_price' => $price, 'onsale' => 0],
+            ['product_id' => $pid]
+        );
+        wc_delete_product_transients($pid);
         $price_done++;
     }
     foreach ($data['stocks'] ?? [] as $u) {
@@ -456,19 +388,23 @@ function shpk_prices_page() {
                 WHERE pm.meta_value = %s OR pm.meta_value = %s
             ", $sku, $sku . '.0'));
             if ($rows) {
-                echo '<table class="wp-list-table widefat fixed striped"><thead><tr><th>ID</th><th>שם</th><th>סטטוס</th><th>סוג</th><th>SKU בDB</th><th>_regular_price</th><th>_sale_price</th><th>_price</th></tr></thead><tbody>';
+                echo '<table class="wp-list-table widefat fixed striped"><thead><tr><th>ID</th><th>שם</th><th>סטטוס</th><th>סוג</th><th>SKU בDB</th><th>_regular_price</th><th>_sale_price</th><th>_price</th><th>מבצע מ</th><th>מבצע עד</th></tr></thead><tbody>';
                 foreach ($rows as $r) {
                     $prices = $wpdb->get_results($wpdb->prepare(
                         "SELECT meta_key, meta_value FROM {$wpdb->postmeta}
-                         WHERE post_id = %d AND meta_key IN ('_price','_regular_price','_sale_price')",
+                         WHERE post_id = %d AND meta_key IN ('_price','_regular_price','_sale_price','_sale_price_dates_from','_sale_price_dates_to')",
                         $r->ID
                     ));
                     $pm = [];
                     foreach ($prices as $p) $pm[$p->meta_key] = $p->meta_value;
+                    $from = $pm['_sale_price_dates_from'] ?? '';
+                    $to   = $pm['_sale_price_dates_to']   ?? '';
                     echo '<tr><td>' . $r->ID . '</td><td>' . esc_html($r->post_title) . '</td><td>' . $r->post_status . '</td><td>' . $r->post_type . '</td><td>' . esc_html($r->sku) . '</td>';
                     echo '<td>' . ($pm['_regular_price'] ?? '—') . '</td>';
                     echo '<td>' . ($pm['_sale_price'] ?? '—') . '</td>';
-                    echo '<td>' . ($pm['_price'] ?? '—') . '</td></tr>';
+                    echo '<td>' . ($pm['_price'] ?? '—') . '</td>';
+                    echo '<td>' . ($from ? date('d/m/Y', (int)$from) : '—') . '</td>';
+                    echo '<td>' . ($to   ? date('d/m/Y', (int)$to)   : '—') . '</td></tr>';
                 }
                 echo '</tbody></table>';
             } else {
@@ -496,60 +432,6 @@ function shpk_prices_page() {
         echo '</form>';
         echo '<p style="margin-top:16px"><a href="' . admin_url('admin.php?page=shushka-prices') . '" class="button">חזרה</a></p></div>';
         return;
-    }
-
-    // ── מיגרציית SKU: תצוגה מקדימה ──────────────────────
-    if (isset($_GET['action']) && $_GET['action'] === 'migrate_preview') {
-        $tkey = sanitize_key($_GET['tkey'] ?? '');
-        $data = $tkey ? get_transient('shpk_migrate_' . $tkey) : null;
-        if (!$data) {
-            echo '<div class="wrap" dir="rtl"><div class="notice notice-error"><p>פג תוקף — אנא העלה שוב.</p></div>';
-            echo '<p><a href="' . $base . '" class="button">חזרה</a></p></div>'; return;
-        }
-        $items = $data['items']; $conflicts = $data['conflicts'];
-        echo '<div class="wrap" dir="rtl"><h1>🔧 תצוגה מקדימה — עדכון ברקודים</h1>';
-        echo '<div style="display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap">';
-        echo '<span style="background:#e8f5e9;border:1px solid #4caf50;border-radius:8px;padding:8px 16px"><strong>' . count($items) . '</strong> מוצרים יעודכנו</span>';
-        if ($conflicts) echo '<span style="background:#fce4ec;border:1px solid #e91e63;border-radius:8px;padding:8px 16px"><strong>' . count($conflicts) . '</strong> התנגשויות</span>';
-        echo '</div>';
-        if ($items) {
-            echo '<form method="post" style="margin-bottom:20px">';
-            wp_nonce_field('shpk_sku_migrate_apply');
-            echo '<input type="hidden" name="shpk_sku_migrate_apply" value="1">';
-            echo '<input type="hidden" name="shpk_tkey" value="' . esc_attr($tkey) . '">';
-            submit_button('✓ אשר עדכון ' . count($items) . ' מוצרים', 'primary large', '', false, ['style' => 'font-size:16px']);
-            echo ' &nbsp;<a href="' . $base . '" class="button button-large">ביטול</a>';
-            echo '</form>';
-            echo '<table class="wp-list-table widefat fixed striped"><thead><tr><th>מוצר</th><th style="width:150px">קוד פנימי (ישן)</th><th style="width:180px">ברקוד (חדש)</th></tr></thead><tbody>';
-            foreach ($items as $u)
-                echo '<tr><td>' . esc_html($u['name']) . '</td><td>' . esc_html($u['old_sku']) . '</td><td><strong>' . esc_html($u['new_sku']) . '</strong></td></tr>';
-            echo '</tbody></table>';
-        } else {
-            echo '<div class="notice notice-info"><p>לא נמצאו מוצרים לעדכון.</p></div>';
-        }
-        if ($conflicts) {
-            echo '<h3 style="margin-top:28px">⚠ ברקוד כבר קיים ב-WooCommerce (' . count($conflicts) . ')</h3>';
-            echo '<table class="wp-list-table widefat fixed striped"><thead><tr><th>מוצר</th><th>קוד פנימי</th><th>ברקוד</th></tr></thead><tbody>';
-            foreach ($conflicts as $c)
-                echo '<tr><td>' . esc_html($c['name']) . '</td><td>' . esc_html($c['code']) . '</td><td>' . esc_html($c['barcode']) . '</td></tr>';
-            echo '</tbody></table>';
-        }
-        echo '</div>'; return;
-    }
-
-    // ── מיגרציית SKU: סיום ───────────────────────────────
-    if (isset($_GET['migrate_done'])) {
-        $n = (int)get_transient('shpk_migrate_result');
-        delete_transient('shpk_migrate_result');
-        echo '<div class="wrap" dir="rtl"><h1>🔧 עדכון ברקודים</h1>';
-        echo '<div class="notice notice-success is-dismissible"><p>✓ עודכנו ' . $n . ' מוצרים — מעכשיו הסנכרון יעבוד לפי ברקוד.</p></div>';
-        echo '<p><a href="' . $base . '" class="button button-primary">חזרה לסנכרון</a></p></div>'; return;
-    }
-    if (isset($_GET['migrate_err'])) {
-        $msgs = ['nofile' => 'לא נבחר קובץ.', 'cols' => 'לא נמצאו עמודות "קוד פריט" ו"ברקוד".', 'empty' => 'לא נמצאו נתונים תקינים בקובץ.', 'expired' => 'פג תוקף — אנא העלה שוב.'];
-        echo '<div class="wrap" dir="rtl"><h1>🔧 עדכון ברקודים</h1>';
-        echo '<div class="notice notice-error"><p>' . esc_html($msgs[$_GET['migrate_err']] ?? 'שגיאה.') . '</p></div>';
-        echo '<p><a href="' . $base . '" class="button">חזרה</a></p></div>'; return;
     }
 
     // ── after hide/restore ────────────────────────────────
@@ -615,10 +497,70 @@ function shpk_prices_page() {
         // missing products export button
         $missing = get_transient('shpk_missing_products');
         if ($missing) {
-            echo '<div style="background:#e8f4fd;border:1px solid #2196f3;border-radius:8px;padding:16px 20px;margin-bottom:16px;display:flex;align-items:center;gap:20px;flex-wrap:wrap">';
-            echo '<span><strong>' . count($missing) . ' מוצרים</strong> בקופה שאינם באתר</span>';
-            echo '<a href="' . admin_url('admin.php?page=shushka-prices&action=export_missing') . '" class="button button-primary">⬇ ייצא CSV של מוצרים חסרים</a>';
+            $mc = count($missing);
+            $nonce_val = wp_create_nonce('shushka_nonce');
+            echo '<div style="background:#e8f4fd;border:1px solid #2196f3;border-radius:8px;padding:16px 20px;margin-bottom:16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">';
+            echo '<span><strong>' . $mc . ' מוצרים</strong> בקופה שאינם באתר</span>';
+            echo '<a href="' . admin_url('admin.php?page=shushka-prices&action=export_missing') . '" class="button">⬇ ייצא CSV</a>';
+            echo '<button type="button" class="button button-primary" id="shpk-import-missing-btn" onclick="shpkImportMissing(' . $mc . ',\'' . $nonce_val . '\')">⬆ ייבא כטיוטות</button>';
+            echo '<button type="button" class="button button-primary" id="shpk-import-ai-btn" style="background:#7c3aed;border-color:#6d28d9" onclick="shpkImportWithAI(' . $mc . ',\'' . $nonce_val . '\')">🤖 ייבא עם AI</button>';
+            echo '<span id="shpk-import-missing-status" style="font-size:13px;color:#2d5a27"></span>';
             echo '</div>';
+            echo '<div id="shpk-ai-progress" style="display:none;background:#f3f0ff;border:1px solid #7c3aed;border-radius:8px;padding:14px 18px;margin-bottom:16px">';
+            echo '<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">';
+            echo '<span id="shpk-ai-progress-label" style="font-weight:600;color:#5b21b6">🤖 מייבא עם AI...</span>';
+            echo '<span id="shpk-ai-counter" style="font-size:13px;color:#7c3aed"></span>';
+            echo '</div>';
+            echo '<div style="background:#e9d5ff;border-radius:4px;height:8px;overflow:hidden"><div id="shpk-ai-bar" style="background:#7c3aed;height:8px;width:0;transition:width .3s"></div></div>';
+            echo '<div id="shpk-ai-log" style="font-size:12px;color:#6b7280;margin-top:6px;max-height:80px;overflow-y:auto;direction:rtl"></div>';
+            echo '</div>';
+            echo '<script>function shpkImportMissing(count,nonce){';
+            echo 'if(!confirm("ייבוא "+count+" מוצרים כטיוטות ל-WooCommerce?\nלאחר הייבוא יש לערוך אותם (תמונה, קטגוריה, תיאור) לפני פרסום."))return;';
+            echo 'var btn=document.getElementById("shpk-import-missing-btn");';
+            echo 'var st=document.getElementById("shpk-import-missing-status");';
+            echo 'btn.disabled=true;btn.textContent="⏳ מייבא...";';
+            echo 'var fd=new FormData();fd.append("action","shpk_import_missing");fd.append("nonce",nonce);';
+            echo 'fetch(ajaxurl,{method:"POST",body:fd}).then(r=>r.json()).then(d=>{';
+            echo 'if(d.success){btn.textContent="✓ יובאו "+d.data.done+" מוצרים";';
+            echo 'st.innerHTML="("+d.data.skip+" דולגו) — <a href=\'"+d.data.admin_url+"\' target=\'_blank\'>לצפייה בטיוטות</a>";}';
+            echo 'else{btn.textContent="✗ שגיאה";btn.disabled=false;st.textContent=d.data;}';
+            echo '});}';
+            echo 'function shpkImportWithAI(total,nonce){';
+            echo 'if(!confirm("ייבוא "+total+" מוצרים עם תיאור AI ותמונה (DALL-E).\nהתהליך ייקח מספר דקות.\nמחיר משוער: כ-$0.04 לכל מוצר.\n\nלהמשיך?"))return;';
+            echo 'var btn=document.getElementById("shpk-import-ai-btn");';
+            echo 'var btn2=document.getElementById("shpk-import-missing-btn");';
+            echo 'var prog=document.getElementById("shpk-ai-progress");';
+            echo 'var bar=document.getElementById("shpk-ai-bar");';
+            echo 'var ctr=document.getElementById("shpk-ai-counter");';
+            echo 'var log=document.getElementById("shpk-ai-log");';
+            echo 'var label=document.getElementById("shpk-ai-progress-label");';
+            echo 'btn.disabled=true;btn2.disabled=true;prog.style.display="block";';
+            echo 'var done=0,skip=0,fail=0;';
+            echo 'function step(offset){';
+            echo 'var fd=new FormData();';
+            echo 'fd.append("action","shpk_import_with_ai");';
+            echo 'fd.append("nonce",nonce);';
+            echo 'fd.append("offset",offset);';
+            echo 'fetch(ajaxurl,{method:"POST",body:fd}).then(r=>r.json()).then(function(d){';
+            echo 'if(!d.success){';
+            echo 'if(d.data&&d.data.indexOf("מפתח")>=0){alert("שגיאת הגדרה:\n"+d.data);btn.disabled=false;btn2.disabled=false;prog.style.display="none";return;}';
+            echo 'log.innerHTML="<span style=\'color:#dc2626\'>✗ שגיאה: "+d.data+"</span><br>"+log.innerHTML;';
+            echo 'fail++;step(offset+1);return;}';
+            echo 'var r=d.data;';
+            echo 'done+=r.done;skip+=r.skip;fail+=r.fail;';
+            echo 'var pct=Math.round((r.offset/r.total)*100);';
+            echo 'bar.style.width=pct+"%";';
+            echo 'ctr.textContent=r.offset+"/"+r.total+" ("+pct+"%)";';
+            echo 'var icon=r.done?"✓":r.skip?"—":"✗";';
+            echo 'var color=r.done?"#16a34a":r.skip?"#6b7280":"#dc2626";';
+            echo 'log.innerHTML="<span style=\'color:"+color+"\'>["+icon+"] "+r.name+(r.log?" — "+r.log:"")+"</span><br>"+log.innerHTML;';
+            echo 'if(r.finished){label.textContent="✓ ייבוא הושלם";';
+            echo 'ctr.textContent="יובאו "+done+" | דולגו "+skip+" | שגיאות "+fail;';
+            echo 'btn.disabled=false;btn2.disabled=false;return;}';
+            echo 'step(r.offset);';
+            echo '}).catch(function(e){fail++;log.innerHTML="<span style=\'color:#dc2626\'>שגיאת רשת: "+e+"</span><br>"+log.innerHTML;step(offset+1);});';
+            echo '}step(0);}';
+            echo '</script>';
         }
 
         // inactive / restore banner
@@ -630,15 +572,31 @@ function shpk_prices_page() {
             if ($inactive_saved) $banner_parts[] = '<strong>' . count($inactive_saved) . ' מוצרים</strong> לא פעילים';
             if ($restore_saved)  $banner_parts[] = '<strong>' . count($restore_saved) . ' מוצרים</strong> מוסתרים לשחזור';
             echo '<span>' . implode(' | ', $banner_parts) . ' זוהו בסנכרון האחרון</span>';
-            echo '<form method="post" style="margin:0">';
-            wp_nonce_field('shpk_hide_inactive');
-            echo '<input type="hidden" name="shpk_hide_inactive" value="1">';
+            $total_vi  = count($inactive_saved ?: []) + count($restore_saved ?: []);
+            $nonce_vi  = wp_create_nonce('shushka_nonce');
             $btn_parts = [];
             if ($inactive_saved) $btn_parts[] = '🙈 הסתר ' . count($inactive_saved);
             if ($restore_saved)  $btn_parts[] = '👁 שחזר ' . count($restore_saved);
-            echo '<button type="submit" class="button button-primary" style="background:#e65100;border-color:#e65100">' . implode(' | ', $btn_parts) . ' מוצרים</button>';
-            echo '</form>';
+            echo '<button type="button" class="button button-primary" id="shpk-hide-btn" style="background:#e65100;border-color:#e65100" onclick="shpkHideBatch(' . $total_vi . ',\'' . $nonce_vi . '\')">' . implode(' | ', $btn_parts) . ' מוצרים</button>';
+            echo '<span id="shpk-hide-status" style="font-size:13px;color:#555"></span>';
             echo '</div>';
+            echo '<script>function shpkHideBatch(total,nonce){';
+            echo 'var btn=document.getElementById("shpk-hide-btn");';
+            echo 'var st=document.getElementById("shpk-hide-status");';
+            echo 'btn.disabled=true;st.textContent="⏳ מעבד 0/"+total+"...";';
+            echo 'var hidden=0,restored=0;';
+            echo 'function hstep(offset){';
+            echo 'var fd=new FormData();fd.append("action","shpk_hide_batch");fd.append("nonce",nonce);fd.append("offset",offset);';
+            echo 'fetch(ajaxurl,{method:"POST",body:fd}).then(r=>r.json()).then(function(d){';
+            echo 'if(!d.success){st.textContent="✗ שגיאה: "+d.data;btn.disabled=false;return;}';
+            echo 'hidden+=d.data.hidden;restored+=d.data.restored;';
+            echo 'st.textContent="⏳ "+d.data.offset+"/"+d.data.total+"...";';
+            echo 'if(d.data.finished){btn.textContent="✓ הושלם";';
+            echo 'st.textContent=(hidden?" הוסתרו "+hidden:"")+(restored?" | שוחזרו "+restored:"");';
+            echo 'return;}hstep(d.data.offset);';
+            echo '}).catch(function(e){st.textContent="✗ שגיאת רשת";btn.disabled=false;});';
+            echo '}hstep(0);}';
+            echo '</script>';
         }
 
         // sku cleanup button
@@ -674,21 +632,12 @@ function shpk_prices_page() {
         echo '<div style="margin:12px 0;display:flex;flex-direction:column;gap:10px">';
         echo '<label style="font-size:15px;display:flex;align-items:center;gap:8px"><input type="checkbox" name="do_prices" value="1" checked> <strong>עדכן מחירים</strong></label>';
         echo '<label style="font-size:15px;display:flex;align-items:center;gap:8px"><input type="checkbox" name="do_stock" value="1"> <strong>עדכן מלאי</strong> <span style="color:#888;font-size:13px">(מלאי 0 מהקופה לא יעודכן)</span></label>';
-        echo '<label style="font-size:15px;display:flex;align-items:center;gap:8px"><input type="checkbox" name="do_inactive" value="1" checked> <strong>זהה מוצרים לא פעילים</strong> <span style="color:#888;font-size:13px">— לא נמכרו מעל</span> <input type="number" name="inactive_months" value="6" min="1" max="60" style="width:55px;text-align:center"> <span style="color:#888;font-size:13px">חודשים</span></label>';
+        echo '<label style="font-size:15px;display:flex;align-items:center;gap:8px"><input type="checkbox" name="do_inactive" value="1" checked> <strong>זהה מוצרים לא פעילים</strong> <span style="color:#888;font-size:13px">— לא נמכרו מעל</span> <input type="number" name="inactive_months" value="12" min="1" max="60" style="width:55px;text-align:center"> <span style="color:#888;font-size:13px">חודשים</span></label>';
         echo '</div>';
         submit_button('📋 טען ותצוגה מקדימה', 'primary large');
         echo '</form></div>';
 
-        // Section 3: SKU migration
-        echo '<div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:20px;margin-top:24px">';
-        echo '<h2 style="margin-top:0">🔧 עדכון מזהי מוצרים לברקוד <span style="font-size:13px;font-weight:400;color:#888">(פעולה חד-פעמית)</span></h2>';
-        echo '<p style="color:#555">מחליפה את הקוד הפנימי של הקופה ב-SKU עם הברקוד האמיתי, כדי שהסנכרון יעבוד נכון ויבוא הזמנות לקופה יזהה את המוצרים.</p>';
-        echo '<form method="post" enctype="multipart/form-data">';
-        wp_nonce_field('shpk_sku_migrate_preview');
-        echo '<input type="hidden" name="shpk_sku_migrate_preview" value="1">';
-        echo '<input type="file" name="shpk_migrate_csv" accept=".csv" required style="margin:12px 0;display:block;font-size:15px">';
-        submit_button('📋 טען ותצוגה מקדימה', 'secondary large');
-        echo '</form></div></div>';
+        echo '</div>';
         return;
     }
 
@@ -697,7 +646,7 @@ function shpk_prices_page() {
     $do_prices       = !empty($_POST['do_prices']);
     $do_stock        = !empty($_POST['do_stock']);
     $do_inactive     = !empty($_POST['do_inactive']);
-    $inactive_months = max(1, (int)($_POST['inactive_months'] ?? 6));
+    $inactive_months = max(1, (int)($_POST['inactive_months'] ?? 12));
     $tmp = $_FILES['shpk_csv']['tmp_name'] ?? '';
     if (!$tmp) { echo '<div class="wrap" dir="rtl"><p class="notice notice-error">לא נבחר קובץ.</p></div>'; return; }
 
@@ -705,7 +654,7 @@ function shpk_prices_page() {
     $lines   = explode("\n", str_replace(["\r\n", "\r"], "\n", trim($raw)));
     $headers = str_getcsv(array_shift($lines));
 
-    $ci_sku = $ci_price = $ci_name = $ci_stock = $ci_date = null;
+    $ci_sku = $ci_price = $ci_name = $ci_stock = $ci_date = $ci_code = null;
     foreach ($headers as $i => $h) {
         $h = trim($h);
         if (mb_strpos($h, 'ברקוד')       !== false) $ci_sku   = $i;
@@ -713,6 +662,7 @@ function shpk_prices_page() {
         if (mb_strpos($h, 'תאור')        !== false) $ci_name  = $i;
         if (mb_strpos($h, 'מלאי')        !== false) $ci_stock = $i;
         if ($h === 'מכר')                           $ci_date  = $i;
+        if (mb_strpos($h, 'קוד פריט')   !== false) $ci_code  = $i;
     }
     if ($ci_sku === null || ($do_prices && $ci_price === null) || ($do_stock && $ci_stock === null)) {
         echo '<div class="wrap" dir="rtl"><h1>🔄 סנכרון קופה</h1>';
@@ -720,12 +670,16 @@ function shpk_prices_page() {
         echo '<p><a href="' . $base . '" class="button">חזרה</a></p></div>'; return;
     }
 
-    $csv = [];
+    $csv = []; $csv_pos_codes = [];
     foreach ($lines as $line) {
         if (!trim($line)) continue;
-        $c     = str_getcsv($line);
-        $sku   = preg_replace('/\.0+$/', '', trim($c[$ci_sku] ?? ''));
+        $c       = str_getcsv($line);
+        $barcode = preg_replace('/\.0+$/', '', trim($c[$ci_sku] ?? ''));
+        $code    = $ci_code !== null ? preg_replace('/\.0+$/', '', trim($c[$ci_code] ?? '')) : '';
+        // use barcode when valid; fall back to POS internal code for items packed in-house (no barcode)
+        $sku     = ($barcode !== '' && $barcode !== '0') ? $barcode : $code;
         if ($sku === '') continue;
+        if ($code !== '') $csv_pos_codes[$code] = true;
         $price     = $ci_price !== null ? (float)str_replace([',', ' '], ['.', ''], trim($c[$ci_price] ?? '')) : null;
         $stock     = $ci_stock !== null ? (int)trim($c[$ci_stock] ?? '') : null;
         $name      = trim($c[$ci_name]  ?? '');
@@ -746,16 +700,29 @@ function shpk_prices_page() {
         JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = '_sku'
         WHERE p.post_type IN ('product','product_variation')
           AND p.post_status NOT IN ('trash','auto-draft') AND pm.meta_value != ''
+        ORDER BY p.ID ASC
     ");
-    $wc_map = [];
+    $wc_map = []; $sku_seen = []; $sku_dupes = [];
     foreach ($rows as $r) {
         $s = preg_replace('/\.0+$/', '', trim($r->sku)); // strip Excel .0 suffix
-        $wc_map[$s] = (int)$r->ID;
+        if (isset($sku_seen[$s])) $sku_dupes[$s][] = (int)$r->ID;
+        else $sku_seen[$s] = (int)$r->ID;
+        $wc_map[$s] = (int)$r->ID; // highest ID wins (most recently created)
+    }
+    if ($sku_dupes) {
+        echo '<div class="notice notice-warning"><p><strong>⚠ ברקודים כפולים ב-WooCommerce:</strong> ';
+        $msgs = [];
+        foreach ($sku_dupes as $sk => $ids) {
+            $all_ids = array_unique(array_merge([$sku_seen[$sk]], $ids));
+            $msgs[] = 'ברקוד ' . esc_html($sk) . ' — מוצרים: ' . implode(', ', $all_ids);
+        }
+        echo implode('; ', $msgs);
+        echo '<br>הפלאגין משתמש במוצר האחרון שנוצר (ID גבוה ביותר). מומלץ למחוק את הכפילויות מ-WooCommerce.</p></div>';
     }
 
     // ── match & build lists ──────────────────────────────
     @set_time_limit(300);
-    $price_changes = []; $stock_changes = []; $stock_zero = []; $not_in_wc = []; $inactive = []; $to_restore = [];
+    $price_changes = []; $stock_changes = []; $stock_zero = []; $not_in_wc = []; $inactive = []; $to_restore = []; $in_wc_not_csv = [];
     $price_same = $stock_same = 0;
     $threshold = $do_inactive ? new DateTime('-' . $inactive_months . ' months') : null;
 
@@ -780,13 +747,38 @@ function shpk_prices_page() {
         if ($do_inactive && $threshold && $ci_date !== null) {
             $last_sale = $d['last_sale'] ?? '';
             $date      = $last_sale ? DateTime::createFromFormat('d/m/Y', $last_sale) : false;
-            if (!$date || $date < $threshold) {
+            if ($date && $date < $threshold && $product->get_catalog_visibility() !== 'hidden') {
                 $inactive[] = ['id' => $wc_map[$sku], 'name' => $product->get_name(),
                                'sku' => $sku, 'last_sale' => $last_sale ?: '—'];
-            } elseif ($product->get_catalog_visibility() === 'hidden') {
+            } elseif ($product->get_catalog_visibility() === 'hidden' && $date && $date >= $threshold) {
+                // Restore only if hidden AND has a recent sale date (within threshold)
                 $to_restore[] = ['id' => $wc_map[$sku], 'name' => $product->get_name(),
                                  'sku' => $sku, 'last_sale' => $last_sale];
             }
+        }
+    }
+
+    // ── מוצרים באתר שאינם בקובץ הקופה ──────────────────
+    $not_in_csv_map = [];
+    foreach ($wc_map as $sku => $id) {
+        if (!isset($csv[$sku]) && !isset($csv_pos_codes[$sku])) $not_in_csv_map[$id] = $sku;
+    }
+    if ($not_in_csv_map) {
+        $ids_sql = implode(',', array_map('intval', array_keys($not_in_csv_map)));
+        $rows = $wpdb->get_results("
+            SELECT p.ID, p.post_title,
+                   COALESCE(pm_vis.meta_value, 'visible') AS visibility
+            FROM {$wpdb->posts} p
+            LEFT JOIN {$wpdb->postmeta} pm_vis ON p.ID = pm_vis.post_id AND pm_vis.meta_key = '_catalog_visibility'
+            WHERE p.ID IN ($ids_sql)
+            ORDER BY p.post_title ASC
+        ");
+        foreach ($rows as $r) {
+            $in_wc_not_csv[] = [
+                'id'   => (int)$r->ID,
+                'sku'  => $not_in_csv_map[(int)$r->ID],
+                'name' => $r->post_title,
+            ];
         }
     }
 
@@ -813,7 +805,8 @@ function shpk_prices_page() {
     if ($do_prices) $chips[] = ['<strong>' . $price_same . '</strong> מחירים ללא שינוי', '#f5f5f5', '#ccc'];
     if ($do_stock)  $chips[] = ['<strong>' . count($stock_changes) . '</strong> כמויות ישתנו', '#e3f2fd', '#2196f3'];
     if ($do_stock)  $chips[] = ['<strong>' . count($stock_zero) . '</strong> מלאי 0 — לא יעודכנו', '#fff8e1', '#ff9800'];
-    if ($not_in_wc) $chips[] = ['<strong>' . count($not_in_wc) . '</strong> לא נמצאו באתר', '#fce4ec', '#e91e63'];
+    if ($not_in_wc)       $chips[] = ['<strong>' . count($not_in_wc) . '</strong> לא נמצאו באתר', '#fce4ec', '#e91e63'];
+    if ($in_wc_not_csv)  $chips[] = ['<strong>' . count($in_wc_not_csv) . '</strong> באתר אך לא בקופה', '#fff3e0', '#ff9800'];
     if ($do_inactive && $ci_date !== null) {
         $chips[] = ['<strong>' . count($inactive) . '</strong> לא פעילים (מעל ' . $inactive_months . ' חודשים)', '#f3e5f5', '#9c27b0'];
         if ($to_restore) $chips[] = ['<strong>' . count($to_restore) . '</strong> מוסתרים לשחזור', '#e8f5e9', '#4caf50'];
@@ -872,8 +865,8 @@ function shpk_prices_page() {
 
     if ($not_in_wc) {
         echo '<h3 style="margin-top:28px">🆕 בקופה אך לא באתר (' . count($not_in_wc) . ')</h3>';
-        echo '<p style="color:#555">מוצרים אלו קיימים בקופה אך לא ב-WooCommerce. ניתן לייצא אותם ולייבא עם הסקריפט.</p>';
-        echo '<a href="' . admin_url('admin.php?page=shushka-prices&action=export_missing') . '" class="button button-primary" style="margin-bottom:16px">⬇ ייצא CSV של מוצרים חסרים</a>';
+        echo '<p style="color:#555">מוצרים אלו קיימים בקופה אך לא ב-WooCommerce. לאחר אישור העדכון תוכל לייבא אותם לאתר ישירות.</p>';
+        echo '<a href="' . admin_url('admin.php?page=shushka-prices&action=export_missing') . '" class="button" style="margin-bottom:16px">⬇ ייצא CSV</a>';
         echo '<table class="wp-list-table widefat fixed striped"><thead><tr><th>שם</th><th>ברקוד</th><th>מחיר</th></tr></thead><tbody>';
         foreach ($not_in_wc as $u)
             echo '<tr><td>' . esc_html($u['name']) . '</td><td>' . esc_html($u['sku']) . '</td><td>₪' . number_format($u['price'] ?? 0, 2) . '</td></tr>';
@@ -904,6 +897,21 @@ function shpk_prices_page() {
         echo '<table class="wp-list-table widefat fixed striped"><thead><tr><th>מוצר</th><th style="width:160px">ברקוד</th><th style="width:130px">נמכר לאחרונה</th></tr></thead><tbody>';
         foreach ($to_restore as $u)
             echo '<tr><td>' . esc_html($u['name']) . '</td><td>' . esc_html($u['sku']) . '</td><td>' . esc_html($u['last_sale']) . '</td></tr>';
+        echo '</tbody></table>';
+    }
+
+    if ($in_wc_not_csv) {
+        echo '<h3 style="margin-top:28px">🔎 באתר אך לא בקובץ הקופה (' . count($in_wc_not_csv) . ')</h3>';
+        echo '<p style="color:#555">מוצרים אלו קיימים ב-WooCommerce אך לא נמצאו בקובץ הקופה שהועלה. ייתכן שהוסרו מהקופה, ברקוד השתנה, או נוצרו ישירות באתר.</p>';
+        echo '<table class="wp-list-table widefat fixed striped"><thead><tr><th>מוצר</th><th style="width:180px">SKU באתר</th><th style="width:80px">עריכה</th></tr></thead><tbody>';
+        foreach ($in_wc_not_csv as $u) {
+            $sku_len   = strlen($u['sku']);
+            $sku_note  = $sku_len >= 8 ? '' : ' <span style="color:#e65100;font-size:11px">(מזהה ישן? ' . $sku_len . ' ספרות)</span>';
+            $edit_url  = get_edit_post_link($u['id']);
+            echo '<tr><td>' . esc_html($u['name']) . '</td>';
+            echo '<td>' . esc_html($u['sku']) . $sku_note . '</td>';
+            echo '<td><a href="' . esc_url($edit_url) . '" target="_blank">✏ ערוך</a></td></tr>';
+        }
         echo '</tbody></table>';
     }
 } // shpk_prices_page()
@@ -1004,6 +1012,14 @@ function shpk_css() { ?>
     .dt td:nth-child(5){font-size:16px;font-weight:700;text-align:center;margin:4px 0}
     .dt td:nth-child(6){margin-top:6px}
     .btn-del{width:100%;padding:14px;font-size:18px;border-radius:12px;letter-spacing:.5px}
+}
+.shpk-nav-btn{background:none;border:none;cursor:pointer;font-size:20px;padding:2px 4px;line-height:1}
+.shpk-nav-btn.has-coords{text-decoration:none;font-size:20px}
+.shpk-nav-btn.no-coords{opacity:.45;transition:opacity .2s}.shpk-nav-btn.no-coords:hover{opacity:1}
+.shpk-note-input{width:100%;padding:4px 6px;border:1px solid #ddd;border-radius:6px;font-size:13px;direction:rtl;transition:background .3s}
+.shpk-note-input:focus{outline:2px solid #183625;border-color:transparent}
+@media print{
+    .shpk-note-input{border:none;background:transparent;padding:0;font-size:12px}
 }
 @media print{
     #wpadminbar,.tabs,.no-print,.hd-actions,.ic,.btn-del{display:none!important}
@@ -1285,6 +1301,8 @@ function shpk_deliver_page($frontend = false) {
                 <th>כתובת</th>
                 <th class="no-print">טלפון</th>
                 <th class="no-print">סה"כ</th>
+                <th class="no-print" style="width:44px">ניווט</th>
+                <th>הערות</th>
                 <th class="no-print">פעולה</th>
             </tr></thead>
             <tbody id="dtbody">
@@ -1295,6 +1313,9 @@ function shpk_deliver_page($frontend = false) {
                 $addr=trim(($ord->get_shipping_address_1()?:$ord->get_billing_address_1()).' '.($ord->get_shipping_address_2()?:''));
                 $phone=$ord->get_billing_phone();
                 $total_price=wc_price($ord->get_total());
+                $uid    = (int)$ord->get_customer_id();
+                $coords = $uid ? get_user_meta($uid, '_shpk_nav_coords', true) : get_post_meta($oid, '_shpk_nav_coords', true);
+                $note   = $uid ? get_user_meta($uid, '_shpk_delivery_notes', true) : get_post_meta($oid, '_shpk_delivery_notes', true);
             ?>
             <tr id="row-<?php echo $oid; ?>" data-city="<?php echo esc_attr($city); ?>" data-phone="<?php echo esc_attr($phone); ?>">
                 <td><strong><?php echo esc_html($city); ?></strong></td>
@@ -1302,6 +1323,20 @@ function shpk_deliver_page($frontend = false) {
                 <td><?php echo esc_html($addr); ?></td>
                 <td class="no-print"><a href="tel:<?php echo esc_attr($phone); ?>">📞 <?php echo esc_html($phone); ?></a></td>
                 <td class="no-print"><?php echo $total_price; ?></td>
+                <td class="no-print" style="text-align:center">
+                    <?php if ($coords):
+                        [$clat, $clng] = array_map('trim', explode(',', $coords, 2)); ?>
+                    <a class="shpk-nav-btn has-coords" href="https://maps.google.com/?q=<?php echo esc_attr($clat.','.$clng); ?>" target="_blank" title="פתח ב-Google Maps">📍</a>
+                    <?php else: ?>
+                    <button class="shpk-nav-btn no-coords" data-oid="<?php echo $oid; ?>" data-uid="<?php echo $uid; ?>" onclick="shpkSaveCoords(this)" title="אני ליד הבית — שמור מיקום">📍<sup style="font-size:9px">+</sup></button>
+                    <?php endif; ?>
+                </td>
+                <td>
+                    <input class="shpk-note-input" type="text"
+                           value="<?php echo esc_attr($note ?: ''); ?>"
+                           data-oid="<?php echo $oid; ?>" data-uid="<?php echo $uid; ?>"
+                           placeholder="הערות…" onblur="shpkSaveNote(this)">
+                </td>
                 <td class="no-print">
                     <button class="btn-del" id="del-<?php echo $oid; ?>"
                         onclick="markDelivered(<?php echo $oid; ?>,this)">מסרתי ✓</button>
@@ -1315,6 +1350,47 @@ function shpk_deliver_page($frontend = false) {
     <script>
     var SHPK_NONCE = '<?php echo $nonce; ?>';
     var SHPK_AJAX  = '<?php echo $ajax_url; ?>';
+
+    /* ── ניווט: שמירת נ"צ ── */
+    function shpkSaveCoords(btn) {
+        if (!navigator.geolocation) { alert('הדפדפן לא תומך ב-GPS'); return; }
+        if (!confirm('לשמור את המיקום הנוכחי שלך כנ"צ של לקוח זה?')) return;
+        btn.textContent = '⏳';
+        navigator.geolocation.getCurrentPosition(function(pos) {
+            var lat = pos.coords.latitude.toFixed(6);
+            var lng = pos.coords.longitude.toFixed(6);
+            fetch(SHPK_AJAX, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: new URLSearchParams({action:'shpk_save_nav_coords', nonce:SHPK_NONCE,
+                      order_id:btn.dataset.oid, user_id:btn.dataset.uid, lat:lat, lng:lng})
+            }).then(function(r){return r.json();}).then(function(d){
+                if (d.success) {
+                    var a = document.createElement('a');
+                    a.className = 'shpk-nav-btn has-coords';
+                    a.href = 'https://maps.google.com/?q=' + lat + ',' + lng;
+                    a.target = '_blank';
+                    a.title = 'פתח ב-Google Maps';
+                    a.textContent = '📍';
+                    btn.parentNode.replaceChild(a, btn);
+                } else { btn.textContent = '❌'; }
+            }).catch(function(){ btn.textContent = '❌'; });
+        }, function() { btn.textContent = '📍+'; alert('לא הצלחנו לקבל מיקום. ודא שה-GPS פעיל.'); });
+    }
+
+    /* ── הערות: שמירה ── */
+    function shpkSaveNote(input) {
+        fetch(SHPK_AJAX, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: new URLSearchParams({action:'shpk_save_delivery_note', nonce:SHPK_NONCE,
+                  order_id:input.dataset.oid, user_id:input.dataset.uid, note:input.value})
+        }).then(function(r){return r.json();}).then(function(d){
+            input.style.background = d.success ? '#e8f5ec' : '#ffebee';
+            setTimeout(function(){ input.style.background = ''; }, 1200);
+        });
+    }
+
     function markDelivered(oid, btn) {
         if (!confirm('לסמן הזמנה כ"הושלמה"?')) return;
         btn.disabled = true; btn.textContent = '...';
@@ -1336,6 +1412,207 @@ function shpk_deliver_page($frontend = false) {
     </script>
     <?php
 }
+
+/* ── AJAX: ייבוא מוצרים חסרים לאתר כטיוטות ──────────────── */
+add_action('wp_ajax_shpk_import_missing', function() {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!current_user_can('manage_woocommerce')) { wp_send_json_error('unauthorized'); return; }
+
+    $missing = get_transient('shpk_missing_products');
+    if (!$missing) { wp_send_json_error('אין מוצרים — טען שוב קובץ קופה.'); return; }
+
+    $done = $skip = $fail = 0;
+    foreach ($missing as $m) {
+        $barcode = sanitize_text_field($m['sku']   ?? '');
+        $name    = sanitize_text_field($m['name']  ?? '');
+        $price   = (float)($m['price'] ?? 0);
+        if (!$barcode || !$name) { $skip++; continue; }
+        if (wc_get_product_id_by_sku($barcode))  { $skip++; continue; }
+        $product = new WC_Product_Simple();
+        $product->set_name($name);
+        $product->set_sku($barcode);
+        $product->set_regular_price((string)$price);
+        $product->set_status('draft');
+        $product->set_catalog_visibility('visible');
+        $id = $product->save();
+        if ($id) $done++; else $fail++;
+    }
+    wp_send_json_success(['done' => $done, 'skip' => $skip, 'fail' => $fail,
+                          'admin_url' => admin_url('edit.php?post_type=product&post_status=draft')]);
+});
+
+/* ── AJAX: ייבוא מוצרים עם AI ──────────────────────────── */
+add_action('wp_ajax_shpk_import_with_ai', function() {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!current_user_can('manage_woocommerce')) { wp_send_json_error('unauthorized'); return; }
+
+    $anthropic_key = get_option('shushka_anthropic_key', '');
+    $openai_key    = get_option('shushka_openai_key', '');
+    if (!$anthropic_key) { wp_send_json_error('מפתח Anthropic לא מוגדר — הגדר בדף תמונות מוצרים'); return; }
+    if (!$openai_key)    { wp_send_json_error('מפתח OpenAI לא מוגדר — הגדר בדף תמונות מוצרים'); return; }
+
+    $missing = get_transient('shpk_missing_products');
+    if (!$missing) { wp_send_json_error('אין מוצרים — טען שוב קובץ קופה.'); return; }
+
+    $offset = absint($_POST['offset'] ?? 0);
+    $total  = count($missing);
+    if ($offset >= $total) {
+        wp_send_json_success(['done' => 0, 'skip' => 0, 'fail' => 0, 'name' => '', 'log' => '',
+                              'offset' => $total, 'total' => $total, 'finished' => true]);
+        return;
+    }
+
+    $m       = $missing[$offset];
+    $barcode = sanitize_text_field($m['sku']   ?? '');
+    $name    = sanitize_text_field($m['name']  ?? '');
+    $price   = (float)($m['price'] ?? 0);
+
+    @set_time_limit(300);
+
+    $skip = $done = $fail = 0;
+    $log  = '';
+
+    if (!$barcode || !$name) {
+        $skip = 1; $log = 'חסר שם או ברקוד';
+    } elseif (wc_get_product_id_by_sku($barcode)) {
+        $skip = 1; $log = 'כבר קיים';
+    } else {
+        try {
+            $cats_prompt =
+                "ירקניה (129): ירקות (48), פירות (58), עלים ירוקים (41)\n" .
+                "דגנים קטניות ופסטות (130): דגנים (83), קטניות (84), פסטות אטריות ופתיתים (85)\n" .
+                "בישול ואפייה (131): תבלינים (87), שמנים (1895), קמחים ועזרי אפייה (4932), ממתיקים (88), מחלקה אסייתית (91)\n" .
+                "ממרחים רטבים ושימורים (132): ממרחי אגוזים (94), ממרחים מלוחים ורטבים (92), ממרחים מתוקים (1887), סירופים (86), שימורים (93)\n" .
+                "דגני בוקר גרנולה שוקולד וחטיפים (133): גרנולה ודגני בוקר (96), שוקולד (97), חטיפים (100), סוכריות (98)\n" .
+                "עוגיות מאפים וקרקרים (134): עוגיות (103), קרקרים מצות ופריכיות (4929), עוגות (102), לחמים ופיתות (101)\n" .
+                "פירות יבשים ואגוזים (35): פירות יבשים (140), אגוזים וזרעים (4920)\n" .
+                "משקאות (135): מיצים (109), חליטות ותה (107), קפה (108), תחליפי חלב (106), תרכיזים (105)\n" .
+                "מקרר וקפוא (136): תחליפי גבינה (111), תחליפי בשר (4930), טופו וביצים (110), אוכל קפוא (113), גלידות (112), פירות קפואים (4922)\n" .
+                "תוספי תזונה ובריאות (137): ויטמינים ותוספים (114), מוצרים טיפוליים (4927), שמנים אתריים (116)\n" .
+                "קוסמטיקה ורחצה טבעיים (138): שמפו סבון מרכך (121), טיפוח פנים וגוף (119), היגיינת פה ושיניים (120), דאודורנט (4931), הגנת שמש (117), היגיינה נשית (122), לאם ולתינוק (123)\n" .
+                "אקולוגי ומוצרים לבית (139): ניקוי אקולוגי (125), חד פעמי וניירות (124)\n" .
+                "כללי (15)";
+
+            // Pass 1: Claude Haiku — generate descriptions + category + image hint
+            $haiku_prompt =
+                "אתה כותב תוכן לחנות טבע ישראלית בשם שושקה.\n" .
+                "כתוב עבור המוצר: \"{$name}\"\n\n" .
+                "החזר JSON בלבד (ללא markdown):\n" .
+                "{\n" .
+                "  \"short_description\": \"תיאור קצר של 1-2 משפטים המדגיש יתרונות בריאותיים עיקריים\",\n" .
+                "  \"description\": \"תיאור מפורט של 3-5 משפטים הכולל: מה המוצר, מהיכן מגיע, יתרונות תזונתיים, ואיך ניתן להשתמש בו\",\n" .
+                "  \"category_id\": <מספר קטגוריה מהרשימה הכי מתאימה>,\n" .
+                "  \"image_hint\": \"תיאור ויזואלי קצר באנגלית של המוצר עצמו (צבע, צורה, אריזה) — משפט אחד, ללא שמות מותגים\"\n" .
+                "}\n\n" .
+                "קטגוריות:\n{$cats_prompt}";
+
+            $haiku_raw = shpk_claude_call($anthropic_key, $haiku_prompt, 'claude-haiku-4-5-20251001', 1200);
+            $haiku_raw = preg_replace('/```json?\s*|\s*```/', '', trim($haiku_raw));
+            // Hebrew abbreviation quotes (מ"ג, ד"ר) break JSON — escape them before parsing
+            $haiku_raw = preg_replace('/([א-ת])"([א-ת])/u', '$1\\"$2', $haiku_raw);
+            // Extract JSON object even if model added text before/after it
+            if (ltrim($haiku_raw) === '' || ltrim($haiku_raw)[0] !== '{') {
+                preg_match('/\{[\s\S]*\}/u', $haiku_raw, $jm);
+                $haiku_raw = $jm[0] ?? $haiku_raw;
+            }
+            $d1 = json_decode($haiku_raw, true);
+            if (!$d1 || !isset($d1['short_description']))
+                throw new Exception('Haiku parse error: ' . mb_substr(preg_replace('/\s+/', ' ', $haiku_raw), 0, 150));
+
+            // Pass 2: Claude Sonnet — validate & correct
+            $sonnet_prompt =
+                "בדוק ותקן את התוכן הבא עבור המוצר \"{$name}\" בחנות טבע ישראלית:\n\n" .
+                "short_description: " . ($d1['short_description'] ?? '') . "\n" .
+                "description: "       . ($d1['description']       ?? '') . "\n" .
+                "category_id: "       . ($d1['category_id']       ?? 15) . "\n\n" .
+                "קטגוריות:\n{$cats_prompt}\n\n" .
+                "בדוק שגיאות עברית, דיוק המידע והתאמת הקטגוריה.\n" .
+                "החזר JSON בלבד (ללא markdown):\n" .
+                "{\n  \"short_description\": \"...\",\n  \"description\": \"...\",\n  \"category_id\": <מספר>\n}";
+
+            $sonnet_raw = shpk_claude_call($anthropic_key, $sonnet_prompt, 'claude-sonnet-4-6', 1200);
+            $sonnet_raw = preg_replace('/```json?\s*|\s*```/', '', trim($sonnet_raw));
+            $sonnet_raw = preg_replace('/([א-ת])"([א-ת])/u', '$1\\"$2', $sonnet_raw);
+            $d2 = json_decode($sonnet_raw, true);
+            if (!$d2 || !isset($d2['short_description'])) $d2 = $d1;
+
+            $short_desc  = sanitize_text_field($d2['short_description'] ?? '');
+            $description = wp_kses_post($d2['description']       ?? '');
+            $cat_id      = (int)($d2['category_id']       ?? 15);
+            $img_hint    = sanitize_text_field($d1['image_hint']  ?? $name);
+
+            // Pass 3: DALL-E 3 image
+            $img_prompt =
+                "Warm illustrated style for a natural health food store. Soft watercolor texture, cozy organic aesthetic, " .
+                "natural palette (sage green, warm cream, terracotta, honey yellow). Clean white background, simple centered " .
+                "composition, hand-drawn feel. No text, no labels, no brand names. " .
+                "The product is: {$img_hint}";
+            $img_resp = shpk_openai_image($openai_key, $img_prompt);
+            if (!isset($img_resp['data'][0]['b64_json'])) throw new Exception('DALL-E error: ' . (isset($img_resp['error']['message']) ? $img_resp['error']['message'] : 'unknown'));
+            $image_bytes = base64_decode($img_resp['data'][0]['b64_json']);
+
+            // Upload image to WordPress Media Library
+            $filename  = sanitize_title($name) . '-' . $barcode . '.png';
+            $attach_id = shpk_upload_product_image($image_bytes, $filename, $name);
+
+            // Create WooCommerce product
+            $product = new WC_Product_Simple();
+            $product->set_name($name);
+            $product->set_sku($barcode);
+            $product->set_regular_price((string)$price);
+            $product->set_short_description($short_desc);
+            $product->set_description($description);
+            $product->set_category_ids([$cat_id]);
+            $product->set_image_id($attach_id);
+            $product->set_status('publish');
+            $product->set_catalog_visibility('visible');
+            $id = $product->save();
+            if (!$id) throw new Exception('product save failed');
+
+            $done = 1; $log = "קטגוריה {$cat_id}";
+
+        } catch (Exception $e) {
+            $fail = 1; $log = mb_substr($e->getMessage(), 0, 120);
+        }
+    }
+
+    if (ob_get_length()) ob_clean();
+    wp_send_json_success([
+        'done'     => $done,
+        'skip'     => $skip,
+        'fail'     => $fail,
+        'name'     => $name,
+        'log'      => $log,
+        'offset'   => $offset + 1,
+        'total'    => $total,
+        'finished' => ($offset + 1 >= $total),
+    ]);
+});
+
+/* ── AJAX: שמירת נ"צ ────────────────────────────────────── */
+add_action('wp_ajax_shpk_save_nav_coords', function() {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    $oid = absint($_POST['order_id'] ?? 0);
+    $uid = absint($_POST['user_id']  ?? 0);
+    $lat = (float)($_POST['lat'] ?? 0);
+    $lng = (float)($_POST['lng'] ?? 0);
+    if (!$lat || !$lng) { wp_send_json_error('invalid coords'); return; }
+    $val = round($lat, 6) . ',' . round($lng, 6);
+    if ($uid) update_user_meta($uid, '_shpk_nav_coords', $val);
+    else      update_post_meta($oid, '_shpk_nav_coords', $val);
+    wp_send_json_success();
+});
+
+/* ── AJAX: שמירת הערת משלוח ──────────────────────────────── */
+add_action('wp_ajax_shpk_save_delivery_note', function() {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    $oid  = absint($_POST['order_id'] ?? 0);
+    $uid  = absint($_POST['user_id']  ?? 0);
+    $note = sanitize_text_field($_POST['note'] ?? '');
+    if ($uid) update_user_meta($uid, '_shpk_delivery_notes', $note);
+    else      update_post_meta($oid, '_shpk_delivery_notes', $note);
+    wp_send_json_success();
+});
 
 /* ═══════════════════════════════════════════════════════════
    דף ניהול מוצרים
@@ -1856,12 +2133,31 @@ function shpkLoadShipping() {
     });
 }
 
-function shpkMakeBanner(date, extra) {
+function shpkMakeBanner(isoDate, extra) {
     var extraHtml = extra ? '<br><span style="font-size:.85rem;opacity:.85">' + extra + '</span>' : '';
-    var js = '(function(){if(sessionStorage.getItem(\'sk_sb\'))return;var b=document.getElementById(\'sk-ship-bar\');if(!b)return;b.style.display=\'block\';document.body.prepend?document.body.prepend(b):document.body.insertBefore(b,document.body.firstChild);})();';
+    // At page-load: if data-date is still in the future use it, else auto-compute next Thursday
+    var js = "(function(){" +
+        "if(sessionStorage.getItem('sk_sb'))return;" +
+        "var b=document.getElementById('sk-ship-bar');if(!b)return;" +
+        "var override=b.getAttribute('data-date');" +
+        "var today=new Date().toISOString().slice(0,10);" +
+        "var d=new Date();" +
+        "if(override&&override>today){" +
+        "d=new Date(override+'T12:00:00');" +
+        "}else{" +
+        "var delta=(4-d.getDay()+7)%7;" +
+        "if(delta===0)delta=7;" +
+        "d.setDate(d.getDate()+delta);" +
+        "}" +
+        "var nm=['ראשון','שני','שלישי','רביעי','חמישי','שישי','שבת'];" +
+        "var s=b.querySelector('.sk-ship-date');" +
+        "if(s)s.textContent='יום '+nm[d.getDay()]+' '+d.getDate()+'.'+(d.getMonth()+1);" +
+        "b.style.display='block';" +
+        "document.body.prepend?document.body.prepend(b):document.body.insertBefore(b,document.body.firstChild);" +
+        "})();";
     return '<!-- wp:html -->\n' +
-        '<div id="sk-ship-bar" style="display:none;background:#2d5a27;color:#fff;padding:.9rem 8rem .9rem 1.5rem;text-align:center;font-family:Rubik,sans-serif;font-size:1.05rem;position:relative;z-index:99999;box-shadow:0 2px 8px rgba(0,0,0,.25);line-height:1.5">\n' +
-        '  &#x1F4E6; <strong>המשלוח הבא: ' + date + '</strong>&nbsp;&nbsp;|&nbsp;&nbsp;&#x1F69A; משלוח רק 10&#8362;&nbsp;&nbsp;|&nbsp;&nbsp;חינם מהזמנה מעל 380&#8362;' + extraHtml + '\n' +
+        '<div id="sk-ship-bar" data-date="' + (isoDate || '') + '" style="display:none;background:#2d5a27;color:#fff;padding:.9rem 8rem .9rem 1.5rem;text-align:center;font-family:Rubik,sans-serif;font-size:1.05rem;position:relative;z-index:99999;box-shadow:0 2px 8px rgba(0,0,0,.25);line-height:1.5">\n' +
+        '  &#x1F4E6; <strong>המשלוח הבא: <span class="sk-ship-date"></span></strong>&nbsp;&nbsp;|&nbsp;&nbsp;&#x1F69A; משלוח רק 10&#8362;&nbsp;&nbsp;|&nbsp;&nbsp;חינם מהזמנה מעל 380&#8362;' + extraHtml + '\n' +
         '  <button onclick="document.getElementById(\'sk-ship-bar\').style.display=\'none\';sessionStorage.setItem(\'sk_sb\',\'1\')" style="position:absolute;left:.75rem;top:50%;transform:translateY(-50%);background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.4);border-radius:6px;color:#fff;font-size:.85rem;font-family:Rubik,sans-serif;padding:.3rem .7rem;cursor:pointer;font-weight:600;white-space:nowrap" aria-label="סגור">הבנתי &#x2713;</button>\n' +
         '</div>\n' +
         '<scr' + 'ipt>\n' + js + '\n</sc' + 'ript>\n' +
@@ -1879,7 +2175,7 @@ window.shpkUpdateShipping = async function() {
         var saved = await ajaxPost('shpk_save_shipping', {date: iso, extra: extra});
         if (!saved.success) throw new Error('שגיאה בשמירה');
         var wr = await wpPut('/widgets/' + shippingWidgetId,
-            {sidebar: 'footer1', instance: {raw: {content: shpkMakeBanner(hebrewDate, extra)}}});
+            {sidebar: 'footer1', instance: {raw: {content: shpkMakeBanner(iso, extra)}}});
         var wd = await wr.json();
         if (wd.code) throw new Error(wd.message || 'widget error');
         st.textContent = '✓ הבאנר עודכן — ' + hebrewDate; st.style.color = '#2d5a27';
@@ -2275,6 +2571,14 @@ add_action('wp_ajax_shpk_save_openai_key', function() {
     wp_send_json_success();
 });
 
+/* ── AJAX: שמירת מפתח Anthropic ─────────────────────────── */
+add_action('wp_ajax_shpk_save_anthropic_key', function() {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!current_user_can('manage_woocommerce')) { wp_send_json_error('unauthorized'); return; }
+    update_option('shushka_anthropic_key', sanitize_text_field($_POST['key'] ?? ''));
+    wp_send_json_success();
+});
+
 /* ── AJAX: ציור מחדש של תמונת מוצר ───────────────────── */
 add_action('wp_ajax_shpk_regen_image', 'shpk_regen_image_handler');
 
@@ -2456,13 +2760,59 @@ function shpk_openai_image_edit($key, $image_bytes, $prompt) {
     return json_decode($body, true);
 }
 
+/* ── helpers Anthropic ─────────────────────────────────── */
+function shpk_claude_call($key, $prompt, $model = 'claude-haiku-4-5-20251001', $max_tokens = 1024) {
+    $resp = wp_remote_post('https://api.anthropic.com/v1/messages', [
+        'timeout' => 90,
+        'headers' => [
+            'x-api-key'         => $key,
+            'anthropic-version' => '2023-06-01',
+            'Content-Type'      => 'application/json',
+        ],
+        'body' => wp_json_encode([
+            'model'      => $model,
+            'max_tokens' => $max_tokens,
+            'messages'   => [['role' => 'user', 'content' => $prompt]],
+        ]),
+    ]);
+    if (is_wp_error($resp)) throw new Exception($resp->get_error_message());
+    $data = json_decode(wp_remote_retrieve_body($resp), true);
+    if (isset($data['error'])) throw new Exception($data['error']['message'] ?? 'Anthropic error');
+    return trim($data['content'][0]['text'] ?? '');
+}
+
+function shpk_upload_product_image($image_bytes, $filename, $alt_text) {
+    require_once ABSPATH . 'wp-admin/includes/file.php';
+    require_once ABSPATH . 'wp-admin/includes/image.php';
+    require_once ABSPATH . 'wp-admin/includes/media.php';
+
+    $tmp = wp_tempnam($filename);
+    file_put_contents($tmp, $image_bytes);
+
+    $file = [
+        'name'     => $filename,
+        'type'     => 'image/png',
+        'tmp_name' => $tmp,
+        'error'    => 0,
+        'size'     => strlen($image_bytes),
+    ];
+
+    $attach_id = media_handle_sideload($file, 0, $alt_text);
+    @unlink($tmp);
+
+    if (is_wp_error($attach_id)) throw new Exception($attach_id->get_error_message());
+    update_post_meta($attach_id, '_wp_attachment_image_alt', $alt_text);
+    return (int)$attach_id;
+}
+
 /* ── דף התמונות ────────────────────────────────────────── */
 function shpk_images_page() {
-    $nonce      = wp_create_nonce('shushka_nonce');
-    $wp_nonce   = wp_create_nonce('wp_rest');
-    $openai_key = get_option('shushka_openai_key', '');
-    $ajax_url   = admin_url('admin-ajax.php');
-    $wc_rest    = rtrim(rest_url('wc/v3'), '/');
+    $nonce         = wp_create_nonce('shushka_nonce');
+    $wp_nonce      = wp_create_nonce('wp_rest');
+    $openai_key    = get_option('shushka_openai_key', '');
+    $anthropic_key = get_option('shushka_anthropic_key', '');
+    $ajax_url      = admin_url('admin-ajax.php');
+    $wc_rest       = rtrim(rest_url('wc/v3'), '/');
     ?>
 <style>
 #shpk-img-wrap{font-family:system-ui,sans-serif;direction:rtl;max-width:1400px;margin:0 auto;padding:20px}
@@ -2518,8 +2868,13 @@ function shpk_images_page() {
     <label>מפתח OpenAI:</label>
     <input type="password" id="shpk-openai-key-input" value="<?php echo esc_attr($openai_key); ?>"
            placeholder="sk-proj-...">
-    <button onclick="shpkSaveKey()">שמור מפתח</button>
+    <button onclick="shpkSaveKey()">שמור</button>
     <span class="shpk-key-status" id="shpk-key-status"><?php echo $openai_key ? '✓ מוגדר' : '⚠ לא מוגדר'; ?></span>
+    <label style="margin-right:12px">מפתח Anthropic:</label>
+    <input type="password" id="shpk-anthropic-key-input" value="<?php echo esc_attr($anthropic_key); ?>"
+           placeholder="sk-ant-...">
+    <button onclick="shpkSaveAnthropicKey()">שמור</button>
+    <span class="shpk-key-status" id="shpk-ant-key-status"><?php echo $anthropic_key ? '✓ מוגדר' : '⚠ לא מוגדר'; ?></span>
   </div>
 
   <div id="shpk-img-toolbar">
@@ -2562,6 +2917,17 @@ window.shpkSaveKey = function() {
         body: 'action=shpk_save_openai_key&nonce=' + NONCE + '&key=' + encodeURIComponent(key)
     }).then(function(r){ return r.json(); }).then(function(d){
         document.getElementById('shpk-key-status').textContent = d.success ? '✓ נשמר' : '✗ שגיאה';
+    });
+};
+
+window.shpkSaveAnthropicKey = function() {
+    var key = document.getElementById('shpk-anthropic-key-input').value.trim();
+    fetch(AJAX, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'action=shpk_save_anthropic_key&nonce=' + NONCE + '&key=' + encodeURIComponent(key)
+    }).then(function(r){ return r.json(); }).then(function(d){
+        document.getElementById('shpk-ant-key-status').textContent = d.success ? '✓ נשמר' : '✗ שגיאה';
     });
 };
 
@@ -2690,5 +3056,820 @@ function escA(s){ return String(s||'').replace(/"/g,'&quot;').replace(/'/g,'&#39
 shpkLoadImages(1);
 })();
 </script>
+    <?php
+}
+
+
+/* ═══════════════════════════════════════════════════════════
+   📖 מתכונים — Custom Post Type, Admin & Frontend
+   ═══════════════════════════════════════════════════════════ */
+
+/* ── Activation: seed קטגוריות ותגיות ברירת-מחדל ────────── */
+register_activation_hook(__FILE__, 'shpk_recipes_activate');
+function shpk_recipes_activate() {
+    shpk_recipes_register_cpt(); // register CPT+tax before seeding
+    $cats = ['ארוחה עיקרית', 'ארוחה קלה', 'מאפים', 'קינוחים', 'חטיפים'];
+    foreach ($cats as $c)
+        if (!term_exists($c, 'shpk_rcat')) wp_insert_term($c, 'shpk_rcat');
+    $tags = ['ללא גלוטן', 'ללא סוכר', 'ללא חלב', 'טבעוני', 'עם ביצים', 'קל להכנה', 'עד 30 דקות'];
+    foreach ($tags as $t)
+        if (!term_exists($t, 'shpk_rtag')) wp_insert_term($t, 'shpk_rtag');
+    flush_rewrite_rules();
+}
+
+/* ── רישום CPT + טקסונומיות ─────────────────────────────── */
+function shpk_recipes_register_cpt() {
+    register_post_type('shpk_recipe', [
+        'labels' => [
+            'name'          => 'מתכונים',
+            'singular_name' => 'מתכון',
+            'add_new_item'  => 'הוסף מתכון',
+            'edit_item'     => 'ערוך מתכון',
+            'view_item'     => 'צפה במתכון',
+            'all_items'     => 'כל המתכונים',
+            'search_items'  => 'חפש מתכונים',
+            'not_found'     => 'לא נמצאו מתכונים',
+        ],
+        'public'        => true,
+        'has_archive'   => 'מתכונים',
+        'rewrite'       => ['slug' => 'מתכון', 'with_front' => false],
+        'supports'      => ['title', 'editor', 'thumbnail', 'excerpt'],
+        'menu_icon'     => 'dashicons-food',
+        'show_in_rest'  => true,
+        'menu_position' => 6,
+    ]);
+
+    register_taxonomy('shpk_rcat', 'shpk_recipe', [
+        'labels' => [
+            'name'          => 'קטגוריות',
+            'singular_name' => 'קטגוריה',
+            'all_items'     => 'כל הקטגוריות',
+            'edit_item'     => 'ערוך קטגוריה',
+            'add_new_item'  => 'הוסף קטגוריה',
+        ],
+        'hierarchical' => true,
+        'rewrite'      => ['slug' => 'קטגוריית-מתכון'],
+        'show_in_rest' => true,
+    ]);
+
+    register_taxonomy('shpk_rtag', 'shpk_recipe', [
+        'labels' => [
+            'name'          => 'תגיות מתכון',
+            'singular_name' => 'תגית',
+            'all_items'     => 'כל התגיות',
+            'add_new_item'  => 'הוסף תגית',
+        ],
+        'hierarchical' => false,
+        'rewrite'      => ['slug' => 'תגית-מתכון'],
+        'show_in_rest' => true,
+    ]);
+}
+add_action('init', 'shpk_recipes_register_cpt');
+
+add_action('init', function() {
+    foreach (['_shpk_prep_time' => 'integer', '_shpk_servings' => 'integer', '_shpk_ingredients' => 'string'] as $key => $type)
+        register_post_meta('shpk_recipe', $key, ['show_in_rest' => true, 'single' => true, 'type' => $type, 'auth_callback' => '__return_true']);
+});
+
+/* ── Admin: Meta Box ─────────────────────────────────────── */
+add_action('add_meta_boxes', function() {
+    add_meta_box('shpk_recipe_meta', 'פרטי מתכון ומרכיבים', 'shpk_recipe_meta_box', 'shpk_recipe', 'normal', 'high');
+});
+
+/* ── AJAX: חיפוש מוצרים לתיבת מטא ─────────────────────── */
+add_action('wp_ajax_shpk_product_search', function() {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!current_user_can('edit_posts')) { wp_send_json_error(); return; }
+    $q = sanitize_text_field($_GET['q'] ?? '');
+    if (mb_strlen($q) < 2) { wp_send_json_success([]); return; }
+
+    $by_sku  = wc_get_products(['sku' => $q,  'limit' => 5, 'status' => 'publish', 'return' => 'objects']);
+    $by_name = wc_get_products(['s'   => $q,  'limit' => 8, 'status' => 'publish', 'return' => 'objects']);
+
+    $results = [];
+    $seen = [];
+    foreach (array_merge($by_sku, $by_name) as $p) {
+        if (isset($seen[$p->get_id()])) continue;
+        $seen[$p->get_id()] = true;
+        $results[] = ['id' => $p->get_id(), 'name' => $p->get_name(), 'sku' => $p->get_sku()];
+    }
+    wp_send_json_success($results);
+});
+
+function shpk_recipe_meta_box($post) {
+    wp_nonce_field('shpk_recipe_save', 'shpk_recipe_nonce');
+    $prep   = get_post_meta($post->ID, '_shpk_prep_time', true);
+    $serves = get_post_meta($post->ID, '_shpk_servings',  true);
+    $ingr   = json_decode(get_post_meta($post->ID, '_shpk_ingredients', true) ?: '[]', true) ?: [];
+    ?>
+    <style>
+    #shpk_recipe_meta .inside{direction:rtl;padding:12px 16px}
+    .shpk-r-label{font-weight:600;font-size:13px;display:block;margin:14px 0 5px}
+    .shpk-r-detail-row{display:flex;gap:16px;margin-bottom:4px}
+    .shpk-r-detail-row>div{flex:1}
+    .shpk-r-detail-row input{width:100%;padding:6px 10px;border:1px solid #ddd;border-radius:6px;font-size:14px}
+    .shpk-ingr-header{display:flex;gap:6px;color:#888;font-size:11px;padding:0 10px 4px;margin-top:8px}
+    .shpk-ingr-header span:first-child{width:86px;flex-shrink:0}
+    .shpk-ingr-header span:nth-child(2){flex:1}
+    .shpk-ingr-header span:last-child{width:180px;flex-shrink:0}
+    .shpk-ingr-row{display:flex;gap:6px;align-items:center;margin-bottom:5px;background:#f9f9f9;padding:6px 10px;border-radius:7px;border:1px solid #eee}
+    .shpk-ingr-row input{flex:1;padding:5px 8px;border:1px solid #ddd;border-radius:5px;font-size:13px;background:#fff}
+    .shpk-ingr-row .shpk-qty{flex:0 0 86px}
+    .shpk-ingr-row .shpk-del{background:#e53935;color:#fff;border:none;border-radius:5px;padding:4px 10px;cursor:pointer;font-size:14px;line-height:1;flex-shrink:0}
+    #shpk-ingr-list{margin-bottom:8px}
+    #shpk-add-ingr{background:#2d8c4e;color:#fff;border:none;border-radius:7px;padding:7px 18px;cursor:pointer;font-size:13px;font-weight:700}
+    .shpk-ingr-hint{color:#999;font-size:11px;margin-top:6px}
+    .shpk-pid-wrap{flex:0 0 180px;position:relative}
+    .shpk-pid-search{width:100%;padding:5px 8px;border:1px solid #ddd;border-radius:5px;font-size:12px;background:#fff;box-sizing:border-box}
+    .shpk-pid-search.has-product{border-color:#2d8c4e;background:#f0faf4}
+    .shpk-pid-results{position:absolute;top:100%;right:0;left:0;background:#fff;border:1px solid #ccc;border-radius:5px;box-shadow:0 4px 10px rgba(0,0,0,.15);z-index:99999;display:none;max-height:220px;overflow-y:auto;margin-top:2px}
+    .shpk-pid-item{padding:7px 10px;cursor:pointer;font-size:12px;border-bottom:1px solid #f0f0f0;direction:rtl;text-align:right;line-height:1.4}
+    .shpk-pid-item:last-child{border-bottom:none}
+    .shpk-pid-item:hover{background:#f0f7f0}
+    .shpk-pid-item small{color:#999;display:block;font-size:11px}
+    .shpk-pid-clear{position:absolute;left:6px;top:50%;transform:translateY(-50%);background:none;border:none;color:#bbb;cursor:pointer;font-size:14px;line-height:1;padding:0;display:none}
+    .shpk-pid-wrap:hover .shpk-pid-clear{display:block}
+    </style>
+    <div>
+        <div class="shpk-r-detail-row">
+            <div>
+                <label class="shpk-r-label">⏱ זמן הכנה (דקות)</label>
+                <input type="number" name="shpk_prep_time" value="<?php echo esc_attr($prep); ?>" min="1" max="600">
+            </div>
+            <div>
+                <label class="shpk-r-label">🍽 מספר מנות</label>
+                <input type="number" name="shpk_servings" value="<?php echo esc_attr($serves); ?>" min="1" max="200">
+            </div>
+        </div>
+        <label class="shpk-r-label" style="margin-top:22px">📋 מרכיבים</label>
+        <div class="shpk-ingr-header">
+            <span>כמות</span><span>שם מרכיב</span><span>מוצר בחנות</span>
+        </div>
+        <div id="shpk-ingr-list">
+        <?php foreach ($ingr as $row):
+            $pid      = $row['pid'] ?? '';
+            $pid_name = '';
+            if ($pid) {
+                $p = wc_get_product($pid);
+                if ($p) $pid_name = $p->get_name();
+            }
+        ?>
+            <div class="shpk-ingr-row">
+                <input class="shpk-qty" type="text" name="shpk_ingr_qty[]"  value="<?php echo esc_attr($row['qty']  ?? ''); ?>" placeholder="2 כפות">
+                <input                  type="text" name="shpk_ingr_name[]" value="<?php echo esc_attr($row['name'] ?? ''); ?>" placeholder="שם מרכיב">
+                <div class="shpk-pid-wrap">
+                    <input class="shpk-pid-search<?php echo $pid_name ? ' has-product' : ''; ?>" type="text" placeholder="חפש לפי שם או ברקוד…" autocomplete="off" value="<?php echo esc_attr($pid_name); ?>">
+                    <input type="hidden" name="shpk_ingr_pid[]" value="<?php echo esc_attr($pid); ?>">
+                    <button type="button" class="shpk-pid-clear" title="נקה">✕</button>
+                    <div class="shpk-pid-results"></div>
+                </div>
+                <button type="button" class="shpk-del" onclick="this.closest('.shpk-ingr-row').remove()">✕</button>
+            </div>
+        <?php endforeach; ?>
+        </div>
+        <button type="button" id="shpk-add-ingr">+ הוסף מרכיב</button>
+        <p class="shpk-ingr-hint">חיפוש לפי שם מוצר או ברקוד — רק מוצרים שנמכרים בחנות (אופציונלי).</p>
+    </div>
+    <script>
+    const shpkAjaxNonce = '<?php echo wp_create_nonce("shushka_nonce"); ?>';
+
+    function shpkInitPidSearch(wrap) {
+        const search  = wrap.querySelector('.shpk-pid-search');
+        const hidden  = wrap.querySelector('input[type=hidden]');
+        const results = wrap.querySelector('.shpk-pid-results');
+        const clear   = wrap.querySelector('.shpk-pid-clear');
+        let timer;
+
+        search.addEventListener('input', function() {
+            hidden.value = '';
+            search.classList.remove('has-product');
+            clear.style.display = 'none';
+            clearTimeout(timer);
+            const q = this.value.trim();
+            if (q.length < 2) { results.style.display = 'none'; return; }
+            timer = setTimeout(function() {
+                fetch(ajaxurl + '?action=shpk_product_search&nonce=' + shpkAjaxNonce + '&q=' + encodeURIComponent(q))
+                    .then(function(r){ return r.json(); })
+                    .then(function(data) {
+                        if (!data.success || !data.data.length) { results.style.display = 'none'; return; }
+                        results.innerHTML = data.data.map(function(p) {
+                            return '<div class="shpk-pid-item" data-id="' + p.id + '" data-name="' + p.name.replace(/"/g,'&quot;') + '">'
+                                + p.name
+                                + (p.sku ? '<small>ברקוד: ' + p.sku + '</small>' : '')
+                                + '</div>';
+                        }).join('');
+                        results.style.display = 'block';
+                        results.querySelectorAll('.shpk-pid-item').forEach(function(item) {
+                            item.addEventListener('click', function() {
+                                hidden.value = this.dataset.id;
+                                search.value = this.dataset.name;
+                                search.classList.add('has-product');
+                                clear.style.display = 'block';
+                                results.style.display = 'none';
+                            });
+                        });
+                    });
+            }, 300);
+        });
+
+        clear.addEventListener('click', function() {
+            hidden.value = '';
+            search.value = '';
+            search.classList.remove('has-product');
+            clear.style.display = 'none';
+            results.style.display = 'none';
+        });
+
+        document.addEventListener('click', function(e) {
+            if (!wrap.contains(e.target)) results.style.display = 'none';
+        });
+    }
+
+    // אתחול שורות קיימות
+    document.querySelectorAll('.shpk-pid-wrap').forEach(shpkInitPidSearch);
+
+    // כפתור "הוסף מרכיב"
+    document.getElementById('shpk-add-ingr').addEventListener('click', function() {
+        const div = document.createElement('div');
+        div.className = 'shpk-ingr-row';
+        div.innerHTML = '<input class="shpk-qty" type="text" name="shpk_ingr_qty[]" placeholder="2 כפות">'
+            + '<input type="text" name="shpk_ingr_name[]" placeholder="שם מרכיב">'
+            + '<div class="shpk-pid-wrap">'
+            +   '<input class="shpk-pid-search" type="text" placeholder="חפש לפי שם או ברקוד…" autocomplete="off">'
+            +   '<input type="hidden" name="shpk_ingr_pid[]" value="">'
+            +   '<button type="button" class="shpk-pid-clear" title="נקה">✕</button>'
+            +   '<div class="shpk-pid-results"></div>'
+            + '</div>'
+            + '<button type="button" class="shpk-del" onclick="this.closest(\'.shpk-ingr-row\').remove()">✕</button>';
+        document.getElementById('shpk-ingr-list').appendChild(div);
+        shpkInitPidSearch(div.querySelector('.shpk-pid-wrap'));
+    });
+    </script>
+    <?php
+}
+
+/* ── Admin: שמירת Meta ───────────────────────────────────── */
+add_action('save_post_shpk_recipe', function($post_id) {
+    if (!isset($_POST['shpk_recipe_nonce']) || !wp_verify_nonce($_POST['shpk_recipe_nonce'], 'shpk_recipe_save')) return;
+    if (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE) return;
+    if (!current_user_can('edit_post', $post_id)) return;
+
+    update_post_meta($post_id, '_shpk_prep_time', absint($_POST['shpk_prep_time'] ?? 0));
+    update_post_meta($post_id, '_shpk_servings',  absint($_POST['shpk_servings']  ?? 0));
+
+    $qtys  = (array)($_POST['shpk_ingr_qty']  ?? []);
+    $names = (array)($_POST['shpk_ingr_name'] ?? []);
+    $pids  = (array)($_POST['shpk_ingr_pid']  ?? []);
+    $ingr  = [];
+    foreach ($names as $i => $name) {
+        $name = sanitize_text_field($name);
+        if (!$name) continue;
+        $ingr[] = [
+            'qty'  => sanitize_text_field($qtys[$i] ?? ''),
+            'name' => $name,
+            'pid'  => absint($pids[$i] ?? 0) ?: null,
+        ];
+    }
+    update_post_meta($post_id, '_shpk_ingredients', wp_json_encode($ingr, JSON_UNESCAPED_UNICODE));
+});
+
+/* ── AJAX: הוספת מרכיבים לסל ────────────────────────────── */
+add_action('wp_ajax_shpk_recipe_cart',        'shpk_recipe_cart_ajax');
+add_action('wp_ajax_nopriv_shpk_recipe_cart', 'shpk_recipe_cart_ajax');
+function shpk_recipe_cart_ajax() {
+    check_ajax_referer('shpk_cart_nonce', 'nonce');
+    $ids   = array_filter(array_map('absint', (array)($_POST['ids'] ?? [])));
+    $added = 0;
+    foreach ($ids as $pid) {
+        $product = wc_get_product($pid);
+        if ($product && $product->is_purchasable() && $product->is_in_stock()) {
+            WC()->cart->add_to_cart($pid, 1);
+            $added++;
+        }
+    }
+    wp_send_json_success(['added' => $added, 'cart_url' => wc_get_cart_url()]);
+}
+
+/* ── Frontend: תבניות ───────────────────────────────────── */
+add_action('template_redirect', function() {
+    if (is_singular('shpk_recipe')) {
+        get_header(); shpk_single_recipe(); get_footer(); exit;
+    }
+    if (is_post_type_archive('shpk_recipe') || is_tax('shpk_rcat') || is_tax('shpk_rtag')) {
+        get_header(); shpk_recipe_archive(); get_footer(); exit;
+    }
+});
+
+function shpk_recipe_css() { ?>
+<style>
+.shpk-recipes-wrap,.shpk-recipe-single{max-width:1100px;margin:0 auto;padding:24px 20px;direction:rtl;font-family:'Rubik',Arial,sans-serif}
+.shpk-recipes-wrap h1,.shpk-recipe-single h1{font-size:28px;font-weight:800;color:#183625;margin:0 0 20px}
+.shpk-filter-cats{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.shpk-filter-cats a{padding:7px 20px;border:2px solid #183625;border-radius:20px;text-decoration:none;color:#183625;font-weight:700;font-size:14px;transition:.15s}
+.shpk-filter-cats a.active,.shpk-filter-cats a:hover{background:#183625;color:#fff}
+.shpk-filter-tags{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:28px}
+.shpk-filter-tags a{padding:5px 16px;border:1px solid #bbb;border-radius:20px;text-decoration:none;color:#555;font-size:13px;transition:.15s}
+.shpk-filter-tags a.active,.shpk-filter-tags a:hover{background:#e8f5ec;border-color:#2d8c4e;color:#183625}
+.shpk-recipe-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:24px}
+.shpk-recipe-card{border-radius:16px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.1);transition:transform .2s,box-shadow .2s;background:#fff}
+.shpk-recipe-card:hover{transform:translateY(-4px);box-shadow:0 8px 24px rgba(0,0,0,.15)}
+.shpk-recipe-card a{text-decoration:none;color:inherit;display:block}
+.shpk-recipe-card img{width:100%;height:200px;object-fit:cover;display:block}
+.shpk-card-no-img{width:100%;height:200px;background:linear-gradient(135deg,#e8f5ec,#c8e6c9);display:flex;align-items:center;justify-content:center;font-size:64px}
+.shpk-card-body{padding:16px}
+.shpk-card-body h3{margin:0 0 8px;font-size:17px;font-weight:700;color:#183625;line-height:1.3}
+.shpk-card-meta{display:flex;gap:12px;color:#888;font-size:13px;margin-bottom:8px}
+.shpk-card-tags{display:flex;gap:6px;flex-wrap:wrap}
+.shpk-card-tags span{background:#f0f0f0;border-radius:10px;padding:2px 10px;font-size:11px;color:#555}
+.shpk-recipe-empty{text-align:center;padding:60px 20px;color:#888;font-size:16px}
+.shpk-recipe-single{max-width:900px}
+.shpk-recipe-cover{width:100%;max-height:420px;object-fit:cover;border-radius:14px;margin-bottom:24px;display:block}
+.shpk-recipe-meta-bar{display:flex;gap:24px;background:#f0f7f3;border-radius:12px;padding:16px 20px;margin-bottom:28px;flex-wrap:wrap}
+.shpk-recipe-meta-bar .meta-item{display:flex;flex-direction:column;align-items:center;gap:4px}
+.shpk-recipe-meta-bar .meta-val{font-size:22px;font-weight:800;color:#183625}
+.shpk-recipe-meta-bar .meta-lbl{font-size:12px;color:#888}
+.shpk-recipe-layout{display:grid;grid-template-columns:320px 1fr;gap:36px;align-items:start}
+.shpk-recipe-tags-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px}
+.shpk-recipe-tags-row a{background:#e8f5ec;color:#183625;border-radius:12px;padding:4px 14px;font-size:13px;text-decoration:none;font-weight:600}
+.shpk-recipe-cats-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.shpk-recipe-cats-row a{background:#183625;color:#fff;border-radius:12px;padding:4px 14px;font-size:13px;text-decoration:none;font-weight:600}
+.shpk-ingr-panel{background:#fafafa;border-radius:14px;padding:20px;border:1px solid #e8f5ec;position:sticky;top:80px}
+.shpk-ingr-panel h2{font-size:18px;font-weight:800;color:#183625;margin:0 0 16px}
+.shpk-ingr-list{list-style:none;margin:0 0 20px;padding:0}
+.shpk-ingr-list li{display:flex;align-items:flex-start;gap:10px;padding:10px 0;border-bottom:1px solid #eee;font-size:15px}
+.shpk-ingr-list li:last-child{border-bottom:none}
+.shpk-ingr-list input[type=checkbox]{width:20px;height:20px;flex-shrink:0;accent-color:#2d8c4e;cursor:pointer;margin-top:2px}
+.shpk-ingr-list .ingr-text{flex:1;line-height:1.4}
+.shpk-ingr-list .ingr-qty{color:#888;font-size:13px}
+.shpk-ingr-list .ingr-link{font-size:12px;color:#2d8c4e;text-decoration:none;display:block;margin-top:2px}
+.shpk-ingr-list .ingr-link:hover{text-decoration:underline}
+.shpk-ingr-list li.shpk-have-it .ingr-text{text-decoration:line-through;color:#bbb}
+.shpk-ingr-list li.shpk-no-product{opacity:.75}
+.shpk-ingr-list .shpk-bullet{width:20px;height:20px;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#ccc;font-size:20px;margin-top:2px}
+#shpk-cart-btn{width:100%;background:#183625;color:#fff;border:none;border-radius:10px;padding:14px;font-size:16px;font-weight:700;cursor:pointer;transition:background .15s}
+#shpk-cart-btn:hover{background:#2d8c4e}
+#shpk-cart-btn:disabled{background:#aaa;cursor:default}
+.shpk-cart-msg{display:none;margin-top:10px;padding:10px;border-radius:8px;font-size:14px;text-align:center;font-weight:600}
+.shpk-cart-msg.ok{background:#e8f5ec;color:#183625}
+.shpk-cart-msg.err{background:#ffebee;color:#c62828}
+.shpk-instructions h2{font-size:20px;font-weight:800;color:#183625;margin:0 0 16px}
+.shpk-instructions .entry-content,.shpk-instructions p,.shpk-instructions ol,.shpk-instructions ul{font-size:16px;line-height:1.8;color:#333}
+.shpk-breadcrumb{font-size:13px;color:#888;margin-bottom:12px}
+.shpk-breadcrumb a{color:#2d8c4e;text-decoration:none}
+@media(max-width:700px){
+    .shpk-recipe-layout{grid-template-columns:1fr}
+    .shpk-ingr-panel{position:static}
+    .shpk-recipe-grid{grid-template-columns:1fr 1fr}
+    .shpk-recipe-single h1{font-size:22px}
+}
+@media(max-width:480px){.shpk-recipe-grid{grid-template-columns:1fr}}
+</style>
+<?php }
+
+/* ── ארכיון מתכונים ──────────────────────────────────────── */
+function shpk_recipe_archive() {
+    shpk_recipe_css();
+    $cats    = get_terms(['taxonomy' => 'shpk_rcat', 'hide_empty' => true]);
+    $tags    = get_terms(['taxonomy' => 'shpk_rtag', 'hide_empty' => true]);
+    $cur_cat = is_tax('shpk_rcat') ? get_queried_object() : null;
+    $cur_tag = is_tax('shpk_rtag') ? get_queried_object() : null;
+
+    $q_args = ['post_type' => 'shpk_recipe', 'posts_per_page' => 24, 'post_status' => 'publish'];
+    if ($cur_cat) $q_args['tax_query'] = [['taxonomy' => 'shpk_rcat', 'terms' => $cur_cat->term_id]];
+    if ($cur_tag) $q_args['tax_query'] = [['taxonomy' => 'shpk_rtag', 'terms' => $cur_tag->term_id]];
+    $recipes = new WP_Query($q_args);
+
+    echo '<div class="shpk-recipes-wrap">';
+    echo '<h1>מתכונים</h1>';
+
+    if (!is_wp_error($cats) && $cats) {
+        $all_active = (!$cur_cat && !$cur_tag) ? 'active' : '';
+        echo '<div class="shpk-filter-cats">';
+        echo '<a href="' . esc_url(get_post_type_archive_link('shpk_recipe')) . '" class="' . $all_active . '">הכל</a>';
+        foreach ($cats as $cat) {
+            $a = ($cur_cat && $cur_cat->term_id === $cat->term_id) ? 'active' : '';
+            echo '<a href="' . esc_url(get_term_link($cat)) . '" class="' . $a . '">' . esc_html($cat->name) . '</a>';
+        }
+        echo '</div>';
+    }
+
+    if (!is_wp_error($tags) && $tags) {
+        echo '<div class="shpk-filter-tags">';
+        foreach ($tags as $tag) {
+            $a = ($cur_tag && $cur_tag->term_id === $tag->term_id) ? 'active' : '';
+            echo '<a href="' . esc_url(get_term_link($tag)) . '" class="' . $a . '">' . esc_html($tag->name) . '</a>';
+        }
+        echo '</div>';
+    }
+
+    if ($recipes->have_posts()) {
+        echo '<div class="shpk-recipe-grid">';
+        while ($recipes->have_posts()) {
+            $recipes->the_post();
+            $prep   = get_post_meta(get_the_ID(), '_shpk_prep_time', true);
+            $serves = get_post_meta(get_the_ID(), '_shpk_servings',  true);
+            $rtags  = get_the_terms(get_the_ID(), 'shpk_rtag') ?: [];
+            echo '<div class="shpk-recipe-card"><a href="' . esc_url(get_permalink()) . '">';
+            if (has_post_thumbnail()) {
+                echo get_the_post_thumbnail(null, 'medium_large', ['alt' => esc_attr(get_the_title())]);
+            } else {
+                echo '<div class="shpk-card-no-img">🥗</div>';
+            }
+            echo '<div class="shpk-card-body"><h3>' . esc_html(get_the_title()) . '</h3>';
+            echo '<div class="shpk-card-meta">';
+            if ($prep)   echo '<span>⏱ ' . (int)$prep   . ' דק׳</span>';
+            if ($serves) echo '<span>🍽 ' . (int)$serves . ' מנות</span>';
+            echo '</div>';
+            if ($rtags) {
+                echo '<div class="shpk-card-tags">';
+                foreach (array_slice($rtags, 0, 3) as $t)
+                    echo '<span>' . esc_html($t->name) . '</span>';
+                echo '</div>';
+            }
+            echo '</div></a></div>';
+        }
+        wp_reset_postdata();
+        echo '</div>';
+    } else {
+        echo '<div class="shpk-recipe-empty">😔 לא נמצאו מתכונים בקטגוריה זו.</div>';
+    }
+    echo '</div>';
+}
+
+/* ── מתכון בודד ──────────────────────────────────────────── */
+function shpk_single_recipe() {
+    shpk_recipe_css();
+    the_post();
+    $prep   = get_post_meta(get_the_ID(), '_shpk_prep_time', true);
+    $serves = get_post_meta(get_the_ID(), '_shpk_servings',  true);
+    $ingr   = json_decode(get_post_meta(get_the_ID(), '_shpk_ingredients', true) ?: '[]', true) ?: [];
+    $rcats  = get_the_terms(get_the_ID(), 'shpk_rcat') ?: [];
+    $rtags  = get_the_terms(get_the_ID(), 'shpk_rtag') ?: [];
+    $has_products = !empty(array_filter($ingr, function($i){ return !empty($i['pid']); }));
+
+    echo '<div class="shpk-recipe-single">';
+    echo '<p class="shpk-breadcrumb"><a href="' . esc_url(get_post_type_archive_link('shpk_recipe')) . '">← כל המתכונים</a></p>';
+
+    if ($rcats) {
+        echo '<div class="shpk-recipe-cats-row">';
+        foreach ($rcats as $c) echo '<a href="' . esc_url(get_term_link($c)) . '">' . esc_html($c->name) . '</a>';
+        echo '</div>';
+    }
+
+    echo '<h1>' . esc_html(get_the_title()) . '</h1>';
+
+    if ($rtags) {
+        echo '<div class="shpk-recipe-tags-row">';
+        foreach ($rtags as $t) echo '<a href="' . esc_url(get_term_link($t)) . '">' . esc_html($t->name) . '</a>';
+        echo '</div>';
+    }
+
+    if (has_post_thumbnail())
+        echo '<img class="shpk-recipe-cover" src="' . esc_url(get_the_post_thumbnail_url(null, 'large')) . '" alt="' . esc_attr(get_the_title()) . '">';
+
+    if ($prep || $serves) {
+        echo '<div class="shpk-recipe-meta-bar">';
+        if ($prep)   echo '<div class="meta-item"><span class="meta-val">' . (int)$prep   . '</span><span class="meta-lbl">דקות הכנה</span></div>';
+        if ($serves) echo '<div class="meta-item"><span class="meta-val">' . (int)$serves . '</span><span class="meta-lbl">מנות</span></div>';
+        echo '</div>';
+    }
+
+    echo '<div class="shpk-recipe-layout">';
+
+    if ($ingr) {
+        $nonce = wp_create_nonce('shpk_cart_nonce');
+        echo '<div class="shpk-ingr-panel"><h2>מרכיבים</h2><ul class="shpk-ingr-list">';
+        foreach ($ingr as $item) {
+            $pid  = !empty($item['pid']) ? (int)$item['pid'] : 0;
+            $link = $pid ? get_permalink($pid) : '';
+            if ($pid) {
+                echo '<li data-pid="' . $pid . '">';
+                echo '<input type="checkbox" checked onchange="this.closest(\'li\').classList.toggle(\'shpk-have-it\',!this.checked)">';
+            } else {
+                echo '<li class="shpk-no-product" data-pid="0">';
+                echo '<span class="shpk-bullet">•</span>';
+            }
+            echo '<div class="ingr-text">';
+            if (!empty($item['qty'])) echo '<span class="ingr-qty">' . esc_html($item['qty']) . '</span> ';
+            echo esc_html($item['name']);
+            if ($link) echo '<a class="ingr-link" href="' . esc_url($link) . '" target="_blank">🛒 לצפייה בחנות</a>';
+            echo '</div></li>';
+        }
+        echo '</ul>';
+        if ($has_products) {
+            echo '<button id="shpk-cart-btn" onclick="shpkAddToCart()">🛒 הוסף מסומנים לסל</button>';
+            echo '<div class="shpk-cart-msg" id="shpk-cart-msg"></div>';
+            $ajax = esc_url(admin_url('admin-ajax.php'));
+            $n    = esc_js($nonce);
+            echo '<script>
+function shpkAddToCart(){
+    var checked=[].slice.call(document.querySelectorAll(".shpk-ingr-list li")).filter(function(li){
+        return li.querySelector("input:checked") && li.dataset.pid && li.dataset.pid!=="0";
+    }).map(function(li){return li.dataset.pid;});
+    var msg=document.getElementById("shpk-cart-msg");
+    if(!checked.length){msg.textContent="אנא סמן לפחות מרכיב אחד שנמכר בחנות";msg.className="shpk-cart-msg err";msg.style.display="block";return;}
+    var btn=document.getElementById("shpk-cart-btn");
+    btn.disabled=true;btn.textContent="⏳ מוסיף...";
+    var body=new URLSearchParams({action:"shpk_recipe_cart",nonce:"' . $n . '"});
+    checked.forEach(function(id){body.append("ids[]",id);});
+    fetch("' . $ajax . '",{method:"POST",body:body})
+    .then(function(r){return r.json();}).then(function(d){
+        if(d.success){
+            msg.textContent="✓ "+d.data.added+" מוצרים נוספו לסל!";
+            msg.className="shpk-cart-msg ok";msg.style.display="block";
+            btn.textContent="✓ נוסף לסל";
+            setTimeout(function(){btn.disabled=false;btn.textContent="🛒 הוסף מסומנים לסל";},3000);
+        } else {
+            msg.textContent="שגיאה בהוספה לסל";
+            msg.className="shpk-cart-msg err";msg.style.display="block";
+            btn.disabled=false;btn.textContent="🛒 הוסף מסומנים לסל";
+        }
+    }).catch(function(){btn.disabled=false;btn.textContent="🛒 הוסף מסומנים לסל";});
+}
+</script>';
+        }
+        echo '</div>';
+    }
+
+    echo '<div class="shpk-instructions"><h2>אופן הכנה</h2><div class="entry-content">';
+    the_content();
+    echo '</div></div>';
+
+    echo '</div>'; // layout
+    echo '</div>'; // single
+}
+
+
+/* ═══════════════════════════════════════════════════════════
+   🔄 המלצות מוצרים — המוצרים שאתה בדרך כלל קונה
+   ═══════════════════════════════════════════════════════════ */
+
+/* ── ליבה: מוצרים נרכשים לעיתים קרובות ─────────────────── */
+function shpk_get_frequent_products($user_id, $limit = 15, $exclude_ids = []) {
+    $cache_key = 'shpk_freq_' . $user_id;
+    $counts    = get_transient($cache_key);
+    if ($counts === false) {
+        $orders = wc_get_orders([
+            'customer_id' => $user_id,
+            'status'      => ['wc-completed', 'wc-processing'],
+            'limit'       => 60,
+            'orderby'     => 'date',
+            'order'       => 'DESC',
+        ]);
+        $counts = [];
+        foreach ($orders as $order) {
+            foreach ($order->get_items() as $item) {
+                $pid = (int)$item->get_product_id();
+                if ($pid) $counts[$pid] = ($counts[$pid] ?? 0) + 1;
+            }
+        }
+        arsort($counts);
+        set_transient($cache_key, $counts, HOUR_IN_SECONDS * 6);
+    }
+
+    $result = [];
+    foreach ($counts as $pid => $cnt) {
+        if (!in_array($pid, $exclude_ids, true)) $result[$pid] = $cnt;
+        if (count($result) >= $limit) break;
+    }
+    return $result;
+}
+
+// נקה קאש כשמוזמן הזמנה חדשה
+add_action('woocommerce_order_status_changed', function($order_id) {
+    $order = wc_get_order($order_id);
+    if ($order && $order->get_customer_id())
+        delete_transient('shpk_freq_' . $order->get_customer_id());
+});
+
+/* ── CSS משותף להמלצות ───────────────────────────────────── */
+function shpk_rec_css() {
+    static $printed = false;
+    if ($printed) return;
+    $printed = true; ?>
+<style>
+/* checkout */
+.shpk-rec-checkout{direction:rtl;margin:24px 0;padding:20px;background:#f9fdf9;border:1px solid #d4edda;border-radius:12px}
+.shpk-rec-checkout h3{font-size:16px;font-weight:700;color:#183625;margin:0 0 14px}
+.shpk-rec-list{display:flex;gap:10px;overflow-x:auto;padding-bottom:6px;scrollbar-width:thin}
+.shpk-rec-item{flex:0 0 130px;background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:10px;text-align:center;font-size:13px}
+.shpk-rec-item img{width:100%;aspect-ratio:1;object-fit:cover;border-radius:6px;margin-bottom:6px}
+.shpk-rec-name{font-size:12px;color:#333;margin-bottom:4px;line-height:1.3;min-height:32px}
+.shpk-rec-price{color:#183625;font-weight:700;font-size:13px;margin-bottom:8px}
+.shpk-rec-add{width:100%;background:#183625;color:#fff;border:none;border-radius:7px;padding:6px;cursor:pointer;font-size:13px;font-weight:700;transition:.15s}
+.shpk-rec-add:hover{background:#2d8c4e}
+.shpk-rec-add.added{background:#aaa;cursor:default}
+/* my account */
+.shpk-freq-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:16px;margin-bottom:20px;direction:rtl}
+.shpk-freq-card{background:#fff;border:1px solid #e0e0e0;border-radius:12px;overflow:hidden;display:flex;flex-direction:column}
+.shpk-freq-card img{width:100%;aspect-ratio:1;object-fit:cover;display:block}
+.shpk-freq-info{padding:10px;flex:1}
+.shpk-freq-name{font-size:13px;font-weight:600;color:#183625;margin-bottom:4px;line-height:1.3}
+.shpk-freq-name a{color:inherit;text-decoration:none}
+.shpk-freq-price{color:#555;font-size:13px;margin-bottom:4px}
+.shpk-freq-count{font-size:11px;color:#aaa}
+.shpk-freq-add{width:100%;background:#183625;color:#fff;border:none;padding:10px;cursor:pointer;font-size:14px;font-weight:700;transition:.15s}
+.shpk-freq-add:hover{background:#2d8c4e}
+.shpk-freq-add.added{background:#aaa;cursor:default}
+.shpk-freq-add-all{display:block;margin:0 auto 20px;background:#2d8c4e;color:#fff;border:none;border-radius:10px;padding:14px 32px;font-size:16px;font-weight:700;cursor:pointer;direction:rtl}
+.shpk-freq-add-all:hover{background:#183625}
+.shpk-freq-msg{text-align:center;padding:10px;border-radius:8px;font-size:14px;font-weight:600;margin-top:10px}
+.shpk-freq-msg.ok{background:#e8f5ec;color:#183625}
+/* product page carousel */
+.shpk-rec-carousel-wrap{direction:rtl;margin:32px 0;padding:24px 0;border-top:1px solid #eee}
+.shpk-rec-carousel-wrap h3{font-size:18px;font-weight:800;color:#183625;margin:0 0 16px}
+.shpk-rec-carousel{display:flex;gap:14px;overflow-x:auto;padding-bottom:8px;scrollbar-width:thin;scroll-snap-type:x mandatory}
+.shpk-rec-card{flex:0 0 160px;background:#fff;border:1px solid #e0e0e0;border-radius:12px;overflow:hidden;scroll-snap-align:start;display:flex;flex-direction:column}
+.shpk-rec-card img{width:100%;aspect-ratio:1;object-fit:cover;display:block}
+.shpk-rec-card-name{padding:8px 10px 4px;font-size:13px;font-weight:600;color:#183625;flex:1}
+.shpk-rec-card-name a{color:inherit;text-decoration:none}
+.shpk-rec-card-price{padding:0 10px 8px;font-size:13px;color:#555}
+.shpk-rec-card-add{margin:0 10px 10px;background:#183625;color:#fff;border:none;border-radius:7px;padding:8px;cursor:pointer;font-size:13px;font-weight:700;transition:.15s}
+.shpk-rec-card-add:hover{background:#2d8c4e}
+.shpk-rec-card-add.added{background:#aaa;cursor:default}
+@media(max-width:600px){
+    .shpk-rec-item{flex:0 0 120px}
+    .shpk-rec-card{flex:0 0 140px}
+    .shpk-freq-grid{grid-template-columns:1fr 1fr}
+}
+</style>
+<?php }
+
+/* ── 1. דף Checkout ─────────────────────────────────────── */
+add_action('woocommerce_review_order_before_submit', 'shpk_checkout_recommendations');
+function shpk_checkout_recommendations() {
+    if (!is_user_logged_in()) return;
+    $user_id  = get_current_user_id();
+    $cart_ids = array_column(WC()->cart->get_cart(), 'product_id');
+    $frequent = shpk_get_frequent_products($user_id, 15, $cart_ids);
+    if (!$frequent) return;
+
+    $products = [];
+    foreach (array_keys($frequent) as $pid) {
+        $p = wc_get_product($pid);
+        if ($p && $p->is_purchasable() && $p->is_in_stock()) $products[] = $p;
+        if (count($products) >= 8) break;
+    }
+    if (!$products) return;
+
+    shpk_rec_css();
+    echo '<div class="shpk-rec-checkout"><h3>🔄 בדרך כלל גם קנית — שכחת משהו?</h3><div class="shpk-rec-list">';
+    foreach ($products as $p) {
+        $pid = $p->get_id();
+        echo '<div class="shpk-rec-item">';
+        echo '<a href="' . esc_url(get_permalink($pid)) . '">' . $p->get_image('thumbnail') . '</a>';
+        echo '<div class="shpk-rec-name">' . esc_html($p->get_name()) . '</div>';
+        echo '<div class="shpk-rec-price">' . $p->get_price_html() . '</div>';
+        echo '<button class="shpk-rec-add" data-pid="' . $pid . '">+ הוסף</button>';
+        echo '</div>';
+    }
+    echo '</div></div>';
+    ?>
+    <script>
+    document.querySelectorAll('.shpk-rec-add').forEach(function(btn){
+        btn.addEventListener('click',function(){
+            var pid=this.dataset.pid, self=this;
+            self.disabled=true; self.textContent='⏳';
+            fetch('/?wc-ajax=add_to_cart',{method:'POST',
+                headers:{'Content-Type':'application/x-www-form-urlencoded'},
+                body:'product_id='+pid+'&quantity=1'
+            }).then(function(r){return r.json();}).then(function(d){
+                if(d.error){self.textContent='+ הוסף';self.disabled=false;}
+                else{self.textContent='✓ נוסף';self.classList.add('added');
+                    if(typeof jQuery!=='undefined') jQuery(document.body).trigger('update_checkout');}
+            }).catch(function(){self.textContent='+ הוסף';self.disabled=false;});
+        });
+    });
+    </script>
+    <?php
+}
+
+/* ── 2. דף My Account — לשונית "הזמנות רגילות" ──────────── */
+add_filter('woocommerce_account_menu_items', function($items) {
+    $out = [];
+    foreach ($items as $k => $v) {
+        $out[$k] = $v;
+        if ($k === 'orders') $out['frequent-orders'] = '🔄 הזמנות רגילות';
+    }
+    return $out;
+});
+
+add_action('init', function() {
+    add_rewrite_endpoint('frequent-orders', EP_ROOT | EP_PAGES);
+});
+
+add_action('woocommerce_account_frequent-orders_endpoint', function() {
+    if (!is_user_logged_in()) return;
+    $user_id  = get_current_user_id();
+    $frequent = shpk_get_frequent_products($user_id, 24);
+    shpk_rec_css();
+
+    echo '<h2 style="direction:rtl;font-size:20px;font-weight:800;color:#183625;margin-bottom:8px">המוצרים שאתה בדרך כלל קונה</h2>';
+    if (!$frequent) {
+        echo '<p style="direction:rtl;color:#888">לאחר הזמנה ראשונה, המוצרים שתרכוש לעיתים קרובות יופיעו כאן.</p>';
+        return;
+    }
+    echo '<p style="direction:rtl;font-size:13px;color:#888;margin-bottom:20px">לחץ + כדי להוסיף לסל הקניות</p>';
+    echo '<button class="shpk-freq-add-all" onclick="shpkAddAll()">🛒 הוסף הכל לסל</button>';
+    echo '<div class="shpk-freq-grid">';
+    foreach (array_keys($frequent) as $pid) {
+        $p = wc_get_product($pid);
+        if (!$p || !$p->is_purchasable()) continue;
+        echo '<div class="shpk-freq-card">';
+        echo '<a href="' . esc_url(get_permalink($pid)) . '">' . $p->get_image('thumbnail') . '</a>';
+        echo '<div class="shpk-freq-info">';
+        echo '<div class="shpk-freq-name"><a href="' . esc_url(get_permalink($pid)) . '">' . esc_html($p->get_name()) . '</a></div>';
+        echo '<div class="shpk-freq-price">' . $p->get_price_html() . '</div>';
+        echo '<div class="shpk-freq-count">נרכש ' . $frequent[$pid] . '×</div>';
+        echo '</div>';
+        echo '<button class="shpk-freq-add" data-pid="' . $pid . '">+ הוסף לסל</button>';
+        echo '</div>';
+    }
+    echo '</div>';
+    echo '<div id="shpk-freq-msg" class="shpk-freq-msg"></div>';
+    ?>
+    <script>
+    function shpkDoAdd(btn){
+        var pid=btn.dataset.pid;
+        btn.disabled=true; btn.textContent='⏳';
+        return fetch('/?wc-ajax=add_to_cart',{method:'POST',
+            headers:{'Content-Type':'application/x-www-form-urlencoded'},
+            body:'product_id='+pid+'&quantity=1'
+        }).then(function(r){return r.json();}).then(function(d){
+            if(d.error){btn.textContent='+ הוסף לסל';btn.disabled=false;}
+            else{btn.textContent='✓ נוסף';btn.classList.add('added');}
+            return d;
+        });
+    }
+    document.querySelectorAll('.shpk-freq-add').forEach(function(b){
+        b.addEventListener('click',function(){shpkDoAdd(this);});
+    });
+    function shpkAddAll(){
+        var btns=[].slice.call(document.querySelectorAll('.shpk-freq-add:not(.added):not(:disabled)'));
+        if(!btns.length) return;
+        var msg=document.getElementById('shpk-freq-msg');
+        msg.textContent='מוסיף '+btns.length+' מוצרים...';
+        msg.className='shpk-freq-msg ok'; msg.style.display='block';
+        var i=0;
+        function next(){
+            if(i>=btns.length){
+                msg.textContent='✓ '+btns.length+' מוצרים נוספו לסל!';
+                if(typeof jQuery!=='undefined') jQuery(document.body).trigger('wc_fragment_refresh');
+                return;
+            }
+            shpkDoAdd(btns[i++]).then(function(){setTimeout(next,200);});
+        }
+        next();
+    }
+    </script>
+    <?php
+});
+
+/* ── 3. דף מוצר — carousel ───────────────────────────────── */
+add_action('woocommerce_after_single_product_summary', 'shpk_product_rec_carousel', 25);
+function shpk_product_rec_carousel() {
+    if (!is_user_logged_in()) return;
+    $user_id  = get_current_user_id();
+    $cur_pid  = get_the_ID();
+    $frequent = shpk_get_frequent_products($user_id, 14, [$cur_pid]);
+    if (!$frequent) return;
+
+    $products = [];
+    foreach (array_keys($frequent) as $pid) {
+        $p = wc_get_product($pid);
+        if ($p && $p->is_purchasable() && $p->is_in_stock()) $products[] = $p;
+        if (count($products) >= 10) break;
+    }
+    if (count($products) < 3) return;
+
+    shpk_rec_css();
+    echo '<div class="shpk-rec-carousel-wrap"><h3>המוצרים שאתה בדרך כלל קונה</h3><div class="shpk-rec-carousel">';
+    foreach ($products as $p) {
+        $pid = $p->get_id();
+        echo '<div class="shpk-rec-card">';
+        echo '<a href="' . esc_url(get_permalink($pid)) . '">' . $p->get_image('thumbnail') . '</a>';
+        echo '<div class="shpk-rec-card-name"><a href="' . esc_url(get_permalink($pid)) . '">' . esc_html($p->get_name()) . '</a></div>';
+        echo '<div class="shpk-rec-card-price">' . $p->get_price_html() . '</div>';
+        echo '<button class="shpk-rec-card-add" data-pid="' . $pid . '">+ הוסף</button>';
+        echo '</div>';
+    }
+    echo '</div></div>';
+    ?>
+    <script>
+    document.querySelectorAll('.shpk-rec-card-add').forEach(function(btn){
+        btn.addEventListener('click',function(){
+            var pid=this.dataset.pid,self=this;
+            self.disabled=true; self.textContent='⏳';
+            fetch('/?wc-ajax=add_to_cart',{method:'POST',
+                headers:{'Content-Type':'application/x-www-form-urlencoded'},
+                body:'product_id='+pid+'&quantity=1'
+            }).then(function(r){return r.json();}).then(function(d){
+                self.textContent=d.error?'+ הוסף':'✓';
+                self.disabled=!d.error?true:false;
+                if(!d.error && typeof jQuery!=='undefined') jQuery(document.body).trigger('wc_fragment_refresh');
+            }).catch(function(){self.textContent='+ הוסף';self.disabled=false;});
+        });
+    });
+    </script>
     <?php
 }
