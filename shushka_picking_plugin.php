@@ -4420,7 +4420,7 @@ add_action('wp_ajax_shpk_gforms_detect', function () {
         }
 
         $mapping[$key] = [
-            'col_header'    => $header,
+            'col_header'    => mb_substr($header, 0, 30), // truncated — full header causes TEXT column overflow
             'col_name'      => $product_name,
             'wc_product_id' => $suggested_id,
         ];
