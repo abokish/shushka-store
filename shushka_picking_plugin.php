@@ -4165,11 +4165,25 @@ function shpk_gforms_mapping_tab($sheet_idx, $nonce) {
     echo '<span id="shpk-gf-det-st" style="font-size:13px;color:#555"></span>';
     echo '</div>';
 
-    echo '<div style="display:flex;gap:20px;margin-bottom:16px;font-size:13px;flex-wrap:wrap">';
+    echo '<div style="display:flex;gap:20px;margin-bottom:12px;font-size:13px;flex-wrap:wrap">';
     echo '<span style="color:#4caf50">&#10003; ממופים: <strong>' . $cnt_mapped . '</strong></span>';
     echo '<span style="color:#ff9800">&#9888; ממתינים: <strong>' . $cnt_unmapped . '</strong></span>';
     echo '<span style="color:#aaa">&#8212; דלג: <strong>' . $cnt_skip . '</strong></span>';
-    if ($checkpoint) echo '<span style="color:#999;margin-right:auto">עדכני עד: ' . date_i18n('d/m/Y H:i', $checkpoint) . '</span>';
+    echo '</div>';
+
+    // Checkpoint control
+    $cp_date  = $checkpoint ? date('Y-m-d', $checkpoint) : '';
+    $cp_label = $checkpoint ? date_i18n('d/m/Y H:i', $checkpoint) : 'ללא הגבלה (יובאו כל השורות)';
+    echo '<div style="background:#f9f9f9;border:1px solid #e0e0e0;border-radius:6px;padding:12px 16px;margin-bottom:16px;font-size:13px">';
+    echo '<strong>&#128197; נקודת התחלה לייבוא</strong>';
+    echo '<div style="margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">';
+    echo '<span style="color:#555">ייבא הזמנות מתאריך:</span>';
+    echo '<input type="date" id="shpk-gf-cpinp-' . $esi . '" value="' . esc_attr($cp_date) . '" style="font-size:13px;padding:3px 6px">';
+    echo '<button onclick="shpkGfSetCp(' . $esi . ',\'' . $en . '\')" class="button button-small">&#128190; שמור תאריך</button>';
+    echo '<button onclick="shpkGfSetCpNow(' . $esi . ',\'' . $en . '\')" class="button button-small" style="background:#ff9800;border-color:#e65100;color:#fff" title="מסמן את כל השורות הקיימות כ\'כבר מיובאות\' — רק הזמנות חדשות שיתווספו אחר כך ייובאו">';
+    echo '&#9654; סמן הכל כמיובא (התחל מעכשיו)</button>';
+    echo '</div>';
+    echo '<div style="margin-top:6px;color:#888" id="shpk-gf-cplabel-' . $esi . '">נוכחי: ' . esc_html($cp_label) . '</div>';
     echo '</div>';
 
     if ($mapping) {
@@ -4301,9 +4315,43 @@ function shpk_gforms_mapping_tab($sheet_idx, $nonce) {
             setTimeout(function(){location.reload();},1800);
         }).catch(function(){btn.disabled=false;st.innerHTML='<span style="color:#c00">שגיאת רשת</span>';});
     }
+    function shpkGfSetCp(si,n){
+        var val=document.getElementById('shpk-gf-cpinp-'+si).value;
+        if(!val){alert('בחר תאריך');return;}
+        var ts=Math.floor(new Date(val+'T00:00:00').getTime()/1000);
+        shpkGfSaveCp(si,n,ts);
+    }
+    function shpkGfSetCpNow(si,n){
+        if(!confirm('פעולה זו תסמן את כל ההזמנות הקיימות כ"מיובאות". רק הזמנות חדשות שיתווספו אחרי כן ייובאו. להמשיך?')) return;
+        shpkGfSaveCp(si,n,Math.floor(Date.now()/1000));
+    }
+    function shpkGfSaveCp(si,n,ts){
+        fetch(ajaxurl,{method:'POST',body:new URLSearchParams({action:'shpk_gforms_set_checkpoint',nonce:n,sheet_idx:si,ts:ts})})
+        .then(function(r){return r.json();}).then(function(d){
+            if(d.success){
+                document.getElementById('shpk-gf-cplabel-'+si).textContent='נוכחי: '+d.data.date;
+                document.getElementById('shpk-gf-cpinp-'+si).value=d.data.ymd;
+            }
+        });
+    }
     </script>
     <?php
 }
+
+/* ── AJAX: set checkpoint (start date) ───────────────────── */
+add_action('wp_ajax_shpk_gforms_set_checkpoint', function () {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!current_user_can('manage_woocommerce')) { wp_send_json_error('unauthorized'); return; }
+    $sheet_idx = absint($_POST['sheet_idx'] ?? 0);
+    $ts        = max(0, (int)($_POST['ts'] ?? 0));
+    update_option('shpk_gf_checkpoint_' . $sheet_idx, $ts);
+    delete_transient('shpk_gf_status_' . $sheet_idx);
+    delete_transient('shpk_gf_data_'   . $sheet_idx);
+    $label = $ts ? date_i18n('d/m/Y H:i', $ts) : 'ללא הגבלה';
+    $ymd   = $ts ? date('Y-m-d', $ts) : '';
+    if (ob_get_length()) ob_clean();
+    wp_send_json_success(['date' => $label, 'ymd' => $ymd]);
+});
 
 /* ── AJAX: save settings ──────────────────────────────────── */
 add_action('wp_ajax_shpk_gforms_save_settings', function () {
