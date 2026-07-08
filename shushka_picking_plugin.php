@@ -2,7 +2,7 @@
 /**
  * Plugin Name: שושקה — ניהול חנות
  * Description: ליקוט ומשלוח הזמנות — שושקה
- * Version: 5.4.2
+ * Version: 5.4.3
  */
 defined('ABSPATH') || exit;
 
@@ -4425,12 +4425,22 @@ add_action('wp_ajax_shpk_gforms_detect', function () {
         $new_cols++;
     }
 
-    // delete + add with autoload=no — avoids update_option returning false silently on large data
-    delete_option('shpk_gf_mapping_' . $sheet_idx);
-    $saved = add_option('shpk_gf_mapping_' . $sheet_idx, $mapping, '', 'no');
-    if (!$saved) {
+    // REPLACE INTO bypasses WP object-cache (Redis/Memcached) and update_option quirks
+    global $wpdb;
+    $opt_name = 'shpk_gf_mapping_' . $sheet_idx;
+    $result = $wpdb->replace(
+        $wpdb->options,
+        ['option_name' => $opt_name, 'option_value' => maybe_serialize($mapping), 'autoload' => 'no'],
+        ['%s', '%s', '%s']
+    );
+    // Bust WP's in-memory option cache so the next get_option reads from DB
+    wp_cache_delete($opt_name, 'options');
+    $alloptions = wp_cache_get('alloptions', 'options');
+    if (is_array($alloptions)) { unset($alloptions[$opt_name]); wp_cache_set('alloptions', $alloptions, 'options'); }
+
+    if ($result === false) {
         if (ob_get_length()) ob_clean();
-        wp_send_json_error('שמירת המיפוי נכשלה — ' . count($mapping) . ' רשומות. בדוק הרשאות DB.');
+        wp_send_json_error('שגיאת DB: ' . $wpdb->last_error);
         return;
     }
     if (ob_get_length()) ob_clean();
