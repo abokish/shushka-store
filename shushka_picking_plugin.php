@@ -2,7 +2,7 @@
 /**
  * Plugin Name: שושקה — ניהול חנות
  * Description: ליקוט ומשלוח הזמנות — שושקה
- * Version: 5.3.2
+ * Version: 5.4.0
  */
 defined('ABSPATH') || exit;
 
@@ -613,6 +613,8 @@ function shpk_prices_page() {
             submit_button('🔧 נקה ברקודים עכשיו', 'primary', '', false, ['style' => 'margin:8px 0 0']);
             echo '</form></div>';
         }
+
+        shpk_gforms_status_block();
 
         // Section 1: export
         echo '<div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:20px;margin-bottom:24px">';
@@ -3873,3 +3875,653 @@ function shpk_product_rec_carousel() {
     </script>
     <?php
 }
+
+/* ═══════════════════════════════════════════════════════════
+   ייבוא הזמנות מגוגל טפסים → WooCommerce   (v5.4.0)
+   ═══════════════════════════════════════════════════════════ */
+
+add_action('admin_menu', function () {
+    add_submenu_page(
+        'shushka-pick',
+        'ייבוא מטפסי Google',
+        '📋 טפסי Google',
+        'manage_woocommerce',
+        'shushka-gforms',
+        'shpk_gforms_page'
+    );
+}, 20);
+
+/* ── helpers ──────────────────────────────────────────────── */
+
+function shpk_gforms_sheet_csv_url($url) {
+    if (preg_match('/\/d\/([a-zA-Z0-9_-]+)/', $url, $m))
+        return 'https://docs.google.com/spreadsheets/d/' . $m[1] . '/export?format=csv';
+    return '';
+}
+
+function shpk_gforms_fetch_and_parse($url) {
+    $csv_url = shpk_gforms_sheet_csv_url($url);
+    if (!$csv_url) return null;
+    $resp = wp_remote_get($csv_url, ['timeout' => 30, 'sslverify' => true]);
+    if (is_wp_error($resp) || wp_remote_retrieve_response_code($resp) !== 200) return null;
+    $body = ltrim(wp_remote_retrieve_body($resp), "\xEF\xBB\xBF");
+    if (!$body) return null;
+    $lines = explode("\n", str_replace(["\r\n", "\r"], "\n", trim($body)));
+    if (!$lines) return null;
+    $headers = str_getcsv(array_shift($lines));
+    $rows = [];
+    foreach ($lines as $line) {
+        if (!trim($line)) continue;
+        $rows[] = str_getcsv($line);
+    }
+    return ['headers' => $headers, 'rows' => $rows];
+}
+
+function shpk_gforms_get_sheet_data($sheet_idx) {
+    $t = get_transient('shpk_gf_data_' . $sheet_idx);
+    if ($t !== false) return $t;
+    $sheets = get_option('shpk_gforms_sheets', []);
+    $url = $sheets[$sheet_idx]['url'] ?? '';
+    if (!$url) return null;
+    $data = shpk_gforms_fetch_and_parse($url);
+    if ($data) set_transient('shpk_gf_data_' . $sheet_idx, $data, 20 * MINUTE_IN_SECONDS);
+    return $data;
+}
+
+function shpk_gforms_classify_col($h) {
+    $h = trim($h);
+    if ($h === '') return 'skip';
+    if (stripos($h, 'timestamp') !== false) return 'timestamp';
+    if (preg_match('/שם\s*(מלא|פרטי|פרטי\s*ומשפחה)/u', $h)) return 'name';
+    if (preg_match('/^ישוב$/u', $h)) return 'city';
+    if (preg_match('/טלפון|מס\.?\s*טל/u', $h)) return 'phone';
+    if (preg_match('/מייל|email/iu', $h)) return 'email';
+    if (preg_match('/דברים\s*נוספים|הפתעת\s*השבוע|אינטרס|הערות\s*לה?זמנה/u', $h)) return 'notes';
+    if (preg_match('/אופן\s*איסוף|שעות\s*פתיחה|איך\s*נחשפת/u', $h)) return 'notes';
+    if (preg_match('/Row\s+\d+/i', $h)) return 'skip';
+    if (preg_match('/\[[^\]]+\]/u', $h)) return 'product';
+    return 'skip';
+}
+
+function shpk_gforms_extract_product_name($header) {
+    preg_match_all('/\[([^\]]+)\]/u', $header, $m);
+    $name = !empty($m[1]) ? trim(end($m[1])) : trim($header);
+    $name = preg_replace('/\s*[\d,]+(?:\.\d+)?\s*(?:ש[״"\'"]?ח|₪|שח)[\s\d.]*$/u', '', $name);
+    $name = preg_replace('/^(?:אזל\s*[-–]?\s*|חדש!\s*|מוגבל\s*[-–]?\s*|נגמר\s*[-–]?\s*|חזר!\s*|כמות\s*מוגבלת\s*[-–]?\s*)/u', '', trim($name));
+    return trim(trim($name, " -–\t"));
+}
+
+function shpk_gforms_col_key($header) {
+    return substr(md5(trim($header)), 0, 12);
+}
+
+function shpk_gforms_parse_timestamp($ts) {
+    $ts = trim($ts ?? '');
+    if (!$ts) return null;
+    foreach (['d/m/Y H:i:s', 'n/j/Y H:i:s', 'd/m/Y G:i:s', 'j/n/Y H:i:s', 'Y-m-d H:i:s'] as $fmt) {
+        $dt = DateTime::createFromFormat($fmt, $ts);
+        if ($dt) return $dt;
+    }
+    $t = @strtotime($ts);
+    if ($t && $t > 0) { $dt = new DateTime(); $dt->setTimestamp($t); return $dt; }
+    return null;
+}
+
+function shpk_gforms_update_checkpoint($sheet_idx, $new_rows, $ts_col) {
+    $max_ts = 0;
+    foreach ($new_rows as $row) {
+        $ts_str = $ts_col !== null ? trim($row[$ts_col] ?? '') : '';
+        $dt = $ts_str ? shpk_gforms_parse_timestamp($ts_str) : null;
+        if ($dt && $dt->getTimestamp() > $max_ts) $max_ts = $dt->getTimestamp();
+    }
+    if (!$max_ts) $max_ts = time();
+    update_option('shpk_gf_checkpoint_' . $sheet_idx, $max_ts);
+    delete_transient('shpk_gf_status_' . $sheet_idx);
+    delete_transient('shpk_gf_data_' . $sheet_idx);
+}
+
+/* ── status block (injected into sync page) ───────────────── */
+
+function shpk_gforms_status_block() {
+    $sheets = get_option('shpk_gforms_sheets', []);
+    if (!$sheets) return;
+    $nonce = wp_create_nonce('shushka_nonce');
+
+    echo '<div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:16px 20px;margin-bottom:24px">';
+    echo '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">';
+    echo '<h2 style="margin:0">📋 טפסי הזמנות ישנים</h2>';
+    echo '<a href="' . admin_url('admin.php?page=shushka-gforms') . '" class="button" style="font-size:12px">⚙ הגדרות ומיפוי</a>';
+    echo '</div>';
+
+    foreach ($sheets as $i => $sheet) {
+        if (empty($sheet['url'])) continue;
+
+        $status_key = 'shpk_gf_status_' . $i;
+        $status = get_transient($status_key);
+        if ($status === false) {
+            $data = shpk_gforms_get_sheet_data($i);
+            $new_count = 0; $newest_ts = ''; $err = '';
+            if ($data) {
+                $ts_col = null;
+                foreach ($data['headers'] as $ci => $ch) {
+                    if (shpk_gforms_classify_col($ch) === 'timestamp') { $ts_col = $ci; break; }
+                }
+                $checkpoint = (int)get_option('shpk_gf_checkpoint_' . $i, 0);
+                foreach ($data['rows'] as $row) {
+                    $ts_str = $ts_col !== null ? trim($row[$ts_col] ?? '') : '';
+                    $dt = $ts_str ? shpk_gforms_parse_timestamp($ts_str) : null;
+                    $is_new = $dt ? ($dt->getTimestamp() > $checkpoint) : ($checkpoint === 0);
+                    if ($is_new) { $new_count++; if ($dt && $ts_str > $newest_ts) $newest_ts = $ts_str; }
+                }
+            } else {
+                $err = 'שגיאה בגישה לגיליון';
+            }
+            $status = ['count' => $new_count, 'newest' => $newest_ts, 'err' => $err];
+            if (!$err) set_transient($status_key, $status, 15 * MINUTE_IN_SECONDS);
+        }
+
+        $sep = $i > 0 ? 'border-top:1px solid #eee;' : '';
+        echo '<div style="display:flex;align-items:center;gap:12px;padding:10px 0;' . $sep . 'flex-wrap:wrap">';
+        echo '<span style="min-width:160px;font-weight:600">' . esc_html($sheet['name']) . '</span>';
+
+        if ($status['err']) {
+            echo '<span style="color:#c00;font-size:13px">⚠ ' . esc_html($status['err']) . '</span>';
+        } elseif ($status['count'] > 0) {
+            echo '<span style="color:#e65100;font-weight:600">' . $status['count'] . ' הזמנות חדשות</span>';
+            if ($status['newest']) echo '<span style="color:#888;font-size:12px">(עד ' . esc_html($status['newest']) . ')</span>';
+            echo ' <button class="button button-primary" onclick="shpkGfImport(' . $i . ',\'' . esc_js($nonce) . '\',this)" style="background:#4caf50;border-color:#388e3c">⬆ ייבא ל-WC</button>';
+        } else {
+            $cp = (int)get_option('shpk_gf_checkpoint_' . $i, 0);
+            $cp_label = $cp ? ' <span style="color:#aaa;font-size:12px">(' . date_i18n('d/m H:i', $cp) . ')</span>' : '';
+            echo '<span style="color:#4caf50">✓ עדכני' . $cp_label . '</span>';
+        }
+
+        $mapping_url = admin_url('admin.php?page=shushka-gforms&tab=mapping&sheet=' . $i);
+        echo ' <a href="' . esc_url($mapping_url) . '" class="button" style="font-size:12px;margin-right:auto">מיפוי מוצרים</a>';
+        echo '<span id="shpk-gf-st-' . $i . '" style="font-size:13px;color:#555"></span>';
+        echo '</div>';
+    }
+
+    echo '<script>
+function shpkGfImport(idx,nonce,btn){
+    var st=document.getElementById("shpk-gf-st-"+idx);
+    btn.disabled=true; var done=0,skip=0,fail=0;
+    function step(offset){
+        fetch(ajaxurl,{method:"POST",body:new URLSearchParams({action:"shpk_gforms_import_one",nonce:nonce,sheet_idx:idx,offset:offset})})
+        .then(function(r){return r.json();}).then(function(d){
+            if(!d.success){st.textContent="שגיאה: "+(d.data||"");btn.disabled=false;return;}
+            var r=d.data; done+=r.done||0; skip+=r.skip||0; fail+=r.fail||0;
+            st.innerHTML="יובאו <strong>"+done+"</strong>"+(skip?" | דולגו "+skip:"")+(fail?" | ⚠ "+fail+" שגיאות":"");
+            if(r.finished){btn.textContent="✓ סיום";btn.style.background="#aaa";btn.disabled=true;return;}
+            step(r.next_offset);
+        }).catch(function(e){st.textContent="שגיאת רשת: "+e.message;btn.disabled=false;});
+    }
+    step(0);
+}
+</script>';
+    echo '</div>';
+}
+
+/* ── admin page ───────────────────────────────────────────── */
+
+function shpk_gforms_page() {
+    $tab       = sanitize_key($_GET['tab'] ?? 'settings');
+    $sheet_idx = isset($_GET['sheet']) ? absint($_GET['sheet']) : 0;
+    $nonce     = wp_create_nonce('shushka_nonce');
+    $base      = admin_url('admin.php?page=shushka-gforms');
+
+    echo '<div class="wrap" dir="rtl"><h1>&#128203; ייבוא הזמנות מגוגל טפסים</h1>';
+    echo '<nav class="nav-tab-wrapper" style="margin-bottom:20px">';
+    $active = $tab === 'settings' ? ' nav-tab-active' : '';
+    echo '<a href="' . $base . '" class="nav-tab' . $active . '">&#9881; הגדרות</a>';
+    $sheets = get_option('shpk_gforms_sheets', []);
+    foreach ($sheets as $i => $s) {
+        $active = ($tab === 'mapping' && $sheet_idx === $i) ? ' nav-tab-active' : '';
+        echo '<a href="' . $base . '&tab=mapping&sheet=' . $i . '" class="nav-tab' . $active . '">מיפוי: ' . esc_html($s['name']) . '</a>';
+    }
+    echo '</nav>';
+
+    if ($tab === 'settings') {
+        shpk_gforms_settings_tab($nonce);
+    } elseif ($tab === 'mapping') {
+        shpk_gforms_mapping_tab($sheet_idx, $nonce);
+    }
+    echo '</div>';
+}
+
+function shpk_gforms_settings_tab($nonce) {
+    $default = [
+        ['name' => 'פירות קפואים וגלידות', 'url' => ''],
+        ['name' => 'קניה חברתית',            'url' => ''],
+    ];
+    $sheets = get_option('shpk_gforms_sheets', $default);
+    ?>
+    <div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:24px;max-width:720px">
+    <h2 style="margin-top:0">גיליונות Google Sheets</h2>
+    <p style="color:#555;margin-top:0">הגיליון חייב להיות <strong>פתוח לצפייה לכל מי שיש לו את הקישור</strong>.</p>
+    <table id="shpk-gf-sheets-tbl" class="widefat" style="margin-bottom:16px">
+    <thead><tr><th style="width:200px">שם לתצוגה</th><th>קישור לגיליון</th><th style="width:40px"></th></tr></thead>
+    <tbody>
+    <?php foreach ($sheets as $s): ?>
+    <tr>
+        <td><input type="text" class="shpk-gf-nm" value="<?php echo esc_attr($s['name']); ?>" style="width:100%"></td>
+        <td><input type="url" class="shpk-gf-url" value="<?php echo esc_attr($s['url']); ?>" style="width:100%" placeholder="https://docs.google.com/spreadsheets/d/..."></td>
+        <td><button onclick="this.closest('tr').remove()" class="button" style="color:#c00;padding:0 8px">&#x2715;</button></td>
+    </tr>
+    <?php endforeach; ?>
+    </tbody></table>
+    <button onclick="shpkGfAddRow()" class="button" style="margin-bottom:20px">+ הוסף גיליון</button><br>
+    <button onclick="shpkGfSaveSettings('<?php echo esc_js($nonce); ?>')" class="button button-primary button-large">&#128190; שמור הגדרות</button>
+    <span id="shpk-gf-set-st" style="margin-right:12px;font-size:14px"></span>
+    </div>
+    <script>
+    function shpkGfAddRow(){
+        var tb=document.querySelector('#shpk-gf-sheets-tbl tbody');
+        var tr=document.createElement('tr');
+        tr.innerHTML='<td><input type="text" class="shpk-gf-nm" style="width:100%" placeholder="שם הגיליון"></td>'+
+            '<td><input type="url" class="shpk-gf-url" style="width:100%" placeholder="https://docs.google.com/spreadsheets/d/..."></td>'+
+            '<td><button onclick="this.closest(\'tr\').remove()" class="button" style="color:#c00;padding:0 8px">&#x2715;</button></td>';
+        tb.appendChild(tr);
+    }
+    function shpkGfSaveSettings(nonce){
+        var sheets=[];
+        document.querySelectorAll('#shpk-gf-sheets-tbl tbody tr').forEach(function(tr){
+            sheets.push({name:tr.querySelector('.shpk-gf-nm').value,url:tr.querySelector('.shpk-gf-url').value});
+        });
+        var st=document.getElementById('shpk-gf-set-st'); st.textContent='שומר...';
+        fetch(ajaxurl,{method:'POST',body:new URLSearchParams({action:'shpk_gforms_save_settings',nonce:nonce,sheets:JSON.stringify(sheets)})})
+        .then(function(r){return r.json();}).then(function(d){
+            st.textContent=d.success?'✓ נשמר':'✗ שגיאה: '+(d.data||'');
+            if(d.success) setTimeout(function(){location.reload();},700);
+        });
+    }
+    </script>
+    <?php
+}
+
+function shpk_gforms_mapping_tab($sheet_idx, $nonce) {
+    $sheets = get_option('shpk_gforms_sheets', []);
+    $sheet  = $sheets[$sheet_idx] ?? null;
+    if (!$sheet) { echo '<div class="notice notice-error"><p>גיליון לא נמצא.</p></div>'; return; }
+
+    $mapping    = get_option('shpk_gf_mapping_' . $sheet_idx, []);
+    $checkpoint = (int)get_option('shpk_gf_checkpoint_' . $sheet_idx, 0);
+
+    $cnt_mapped = $cnt_skip = $cnt_unmapped = 0;
+    foreach ($mapping as $e) {
+        $pid = (int)($e['wc_product_id'] ?? 0);
+        if ($pid > 0) $cnt_mapped++;
+        elseif ($pid === -1) $cnt_skip++;
+        else $cnt_unmapped++;
+    }
+
+    $esi = (int)$sheet_idx;
+    $en  = esc_js($nonce);
+
+    echo '<div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:20px">';
+    echo '<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap">';
+    echo '<h2 style="margin:0">מיפוי: ' . esc_html($sheet['name']) . '</h2>';
+    echo '<button onclick="shpkGfDetect(' . $esi . ',\'' . $en . '\')" class="button button-primary" id="shpk-gf-det-btn">&#128269; זיהוי עמודות מהגיליון</button>';
+    echo '<span id="shpk-gf-det-st" style="font-size:13px;color:#555"></span>';
+    echo '</div>';
+
+    echo '<div style="display:flex;gap:20px;margin-bottom:16px;font-size:13px;flex-wrap:wrap">';
+    echo '<span style="color:#4caf50">&#10003; ממופים: <strong>' . $cnt_mapped . '</strong></span>';
+    echo '<span style="color:#ff9800">&#9888; ממתינים: <strong>' . $cnt_unmapped . '</strong></span>';
+    echo '<span style="color:#aaa">&#8212; דלג: <strong>' . $cnt_skip . '</strong></span>';
+    if ($checkpoint) echo '<span style="color:#999;margin-right:auto">עדכני עד: ' . date_i18n('d/m/Y H:i', $checkpoint) . '</span>';
+    echo '</div>';
+
+    if ($mapping) {
+        echo '<div style="margin-bottom:10px;font-size:13px">הצג: ';
+        $filters = ['all' => 'הכל (' . count($mapping) . ')', 'unmapped' => 'ממתינים (' . $cnt_unmapped . ')', 'mapped' => 'ממופים (' . $cnt_mapped . ')', 'skip' => 'דלג (' . $cnt_skip . ')'];
+        foreach ($filters as $v => $lbl) {
+            $chk = $v === 'all' ? ' checked' : '';
+            echo '<label style="margin-left:14px"><input type="radio" name="shpk-gf-flt" value="' . $v . '"' . $chk . ' onchange="shpkGfFilter(this.value)"> ' . $lbl . '</label>';
+        }
+        echo '</div>';
+
+        echo '<table class="wp-list-table widefat fixed striped" id="shpk-gf-map-tbl" style="table-layout:fixed">';
+        echo '<colgroup><col style="width:38%"><col style="width:35%"><col style="width:27%"></colgroup>';
+        echo '<thead><tr><th>שם מוצר מהטופס</th><th>מוצר ב-WooCommerce</th><th>פעולות</th></tr></thead><tbody>';
+
+        foreach ($mapping as $key => $entry) {
+            $pid      = (int)($entry['wc_product_id'] ?? 0);
+            $col_name = esc_html($entry['col_name']   ?? '');
+            $col_hdr  = esc_attr($entry['col_header'] ?? '');
+            $ek       = esc_attr($key);
+
+            if ($pid > 0) {
+                $wc_nm      = esc_html(get_the_title($pid));
+                $match_html = '<span style="color:#4caf50">&#10003; ' . $wc_nm . '</span>';
+                $status_cls = 'mapped';
+            } elseif ($pid === -1) {
+                $match_html = '<span style="color:#aaa">&#8212; דלג</span>';
+                $status_cls = 'skip';
+            } else {
+                $match_html = '<span style="color:#ff9800">&#9888; לא ממופה</span>';
+                $status_cls = 'unmapped';
+            }
+
+            echo '<tr data-key="' . $ek . '" data-status="' . $status_cls . '">';
+            echo '<td title="' . $col_hdr . '" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' . $col_name . '</td>';
+            echo '<td id="shpk-gf-m-' . $ek . '" style="overflow:hidden">' . $match_html . '</td>';
+            echo '<td>';
+            echo '<div id="shpk-gf-a-' . $ek . '">';
+            if ($pid !== -1) {
+                echo '<button onclick="shpkGfShowSrc(\'' . $ek . '\',' . $esi . ',\'' . $en . '\')" class="button button-small">' . ($pid > 0 ? 'שנה' : 'חפש') . '</button> ';
+                echo '<button onclick="shpkGfSaveMap(\'' . $ek . '\',-1,' . $esi . ',\'' . $en . '\')" class="button button-small" style="color:#888">דלג</button>';
+            } else {
+                echo '<button onclick="shpkGfSaveMap(\'' . $ek . '\',0,' . $esi . ',\'' . $en . '\')" class="button button-small">בטל</button>';
+            }
+            echo '</div>';
+            echo '<div id="shpk-gf-s-' . $ek . '" style="display:none;margin-top:4px">';
+            echo '<input type="text" placeholder="חיפוש מוצר..." onkeyup="shpkGfSearch(\'' . $ek . '\',this.value,' . $esi . ',\'' . $en . '\')" style="width:100%;font-size:13px" autocomplete="off">';
+            echo '<div id="shpk-gf-r-' . $ek . '" style="background:#fff;border:1px solid #ddd;border-radius:4px;max-height:150px;overflow-y:auto;margin-top:3px"></div>';
+            echo '<button onclick="document.getElementById(\'shpk-gf-s-' . $ek . '\').style.display=\'none\'" class="button button-small" style="margin-top:3px;font-size:11px">סגור</button>';
+            echo '</div>';
+            echo '</td></tr>';
+        }
+        echo '</tbody></table>';
+    } else {
+        echo '<p style="color:#888">לחץ על <strong>זיהוי עמודות מהגיליון</strong> כדי לטעון את רשימת המוצרים ולהתחיל מיפוי.</p>';
+    }
+
+    echo '</div>';
+    ?>
+    <script>
+    var shpkGfT={};
+    function shpkGfFilter(v){
+        document.querySelectorAll('#shpk-gf-map-tbl tbody tr').forEach(function(tr){
+            tr.style.display=(v==='all'||tr.dataset.status===v)?'':'none';
+        });
+    }
+    function shpkGfShowSrc(key,si,n){
+        var el=document.getElementById('shpk-gf-s-'+key);
+        el.style.display=''; el.querySelector('input').value=''; el.querySelector('input').focus();
+        document.getElementById('shpk-gf-r-'+key).innerHTML='';
+    }
+    function shpkGfSearch(key,q,si,n){
+        clearTimeout(shpkGfT[key]);
+        var rd=document.getElementById('shpk-gf-r-'+key);
+        if(q.length<2){rd.innerHTML='';return;}
+        shpkGfT[key]=setTimeout(function(){
+            fetch(ajaxurl+'?action=shpk_gforms_search_products&nonce='+n+'&q='+encodeURIComponent(q))
+            .then(function(r){return r.json();}).then(function(d){
+                if(!d.success)return;
+                rd.innerHTML=d.data.length?d.data.map(function(p){
+                    var pn=p.name.replace(/'/g,"\\'");
+                    return '<div onclick="shpkGfSel(\''+key+'\','+p.id+',\''+pn+'\','+si+',\''+n+'\')" '+
+                           'style="padding:5px 10px;cursor:pointer;border-bottom:1px solid #f0f0f0;font-size:13px" '+
+                           'onmouseover="this.style.background=\'#f5f5f5\'" onmouseout="this.style.background=\'\'">'+
+                           '<strong>'+p.name+'</strong> <span style="color:#aaa;font-size:11px">'+p.sku+'</span></div>';
+                }).join(''):'<div style="padding:8px;color:#888;font-size:13px">לא נמצאו תוצאות</div>';
+            });
+        },280);
+    }
+    function shpkGfSel(key,pid,pname,si,n){
+        document.getElementById('shpk-gf-s-'+key).style.display='none';
+        shpkGfSaveMap(key,pid,si,n,pname);
+    }
+    function shpkGfSaveMap(key,pid,si,n,pname){
+        fetch(ajaxurl,{method:'POST',body:new URLSearchParams({action:'shpk_gforms_save_mapping',nonce:n,sheet_idx:si,col_key:key,wc_product_id:pid})})
+        .then(function(r){return r.json();}).then(function(d){
+            if(!d.success)return;
+            var mc=document.getElementById('shpk-gf-m-'+key);
+            var ac=document.getElementById('shpk-gf-a-'+key);
+            var tr=document.querySelector('tr[data-key="'+key+'"]');
+            if(pid>0){
+                var nm=pname||(d.data&&d.data.name)||pid;
+                mc.innerHTML='<span style="color:#4caf50">✓ '+nm+'</span>';
+                ac.innerHTML='<button onclick="shpkGfShowSrc(\''+key+'\','+si+',\''+n+'\')" class="button button-small">שנה</button> '+
+                    '<button onclick="shpkGfSaveMap(\''+key+'\',-1,'+si+',\''+n+'\')" class="button button-small" style="color:#888">דלג</button>';
+                tr.dataset.status='mapped';
+            } else if(pid==-1){
+                mc.innerHTML='<span style="color:#aaa">— דלג</span>';
+                ac.innerHTML='<button onclick="shpkGfSaveMap(\''+key+'\',0,'+si+',\''+n+'\')" class="button button-small">בטל</button>';
+                tr.dataset.status='skip';
+            } else {
+                mc.innerHTML='<span style="color:#ff9800">⚠ לא ממופה</span>';
+                ac.innerHTML='<button onclick="shpkGfShowSrc(\''+key+'\','+si+',\''+n+'\')" class="button button-small">חפש</button> '+
+                    '<button onclick="shpkGfSaveMap(\''+key+'\',-1,'+si+',\''+n+'\')" class="button button-small" style="color:#888">דלג</button>';
+                tr.dataset.status='unmapped';
+            }
+        });
+    }
+    function shpkGfDetect(si,n){
+        var btn=document.getElementById('shpk-gf-det-btn');
+        var st=document.getElementById('shpk-gf-det-st');
+        btn.disabled=true; st.textContent='⏳ טוען גיליון...';
+        fetch(ajaxurl,{method:'POST',body:new URLSearchParams({action:'shpk_gforms_detect',nonce:n,sheet_idx:si})})
+        .then(function(r){return r.json();}).then(function(d){
+            btn.disabled=false;
+            if(!d.success){st.textContent='✗ '+(d.data||'שגיאה');return;}
+            st.textContent='✓ נמצאו '+d.data.new_cols+' עמודות חדשות (סה"כ '+d.data.total+')';
+            if(d.data.new_cols>0||d.data.total>0) setTimeout(function(){location.reload();},600);
+        }).catch(function(){btn.disabled=false;st.textContent='שגיאת רשת';});
+    }
+    </script>
+    <?php
+}
+
+/* ── AJAX: save settings ──────────────────────────────────── */
+add_action('wp_ajax_shpk_gforms_save_settings', function () {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!current_user_can('manage_woocommerce')) { wp_send_json_error('unauthorized'); return; }
+    $raw = json_decode(wp_unslash($_POST['sheets'] ?? '[]'), true);
+    if (!is_array($raw)) { wp_send_json_error('bad data'); return; }
+    $sheets = [];
+    foreach ($raw as $s) {
+        $name = sanitize_text_field($s['name'] ?? '');
+        $url  = esc_url_raw($s['url']  ?? '');
+        if ($name && $url) $sheets[] = ['name' => $name, 'url' => $url];
+    }
+    update_option('shpk_gforms_sheets', $sheets);
+    if (ob_get_length()) ob_clean();
+    wp_send_json_success(['count' => count($sheets)]);
+});
+
+/* ── AJAX: detect + auto-map columns ─────────────────────── */
+add_action('wp_ajax_shpk_gforms_detect', function () {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!current_user_can('manage_woocommerce')) { wp_send_json_error('unauthorized'); return; }
+    @set_time_limit(120);
+
+    $sheet_idx = absint($_POST['sheet_idx'] ?? 0);
+    $sheets    = get_option('shpk_gforms_sheets', []);
+    if (empty($sheets[$sheet_idx]['url'])) { wp_send_json_error('גיליון לא מוגדר'); return; }
+
+    delete_transient('shpk_gf_data_' . $sheet_idx);
+    $data = shpk_gforms_get_sheet_data($sheet_idx);
+    if (!$data) { wp_send_json_error('לא ניתן לגשת לגיליון — בדוק שהוא ציבורי'); return; }
+
+    // One DB query builds the full WC name→id map (avoids N searches per column)
+    global $wpdb;
+    $db_rows = $wpdb->get_results(
+        "SELECT ID, post_title FROM {$wpdb->posts} WHERE post_type='product' AND post_status='publish'"
+    );
+    $wc_name_map = [];
+    foreach ($db_rows as $r) {
+        $wc_name_map[mb_strtolower(trim($r->post_title))] = (int)$r->ID;
+    }
+
+    $mapping  = get_option('shpk_gf_mapping_' . $sheet_idx, []);
+    $new_cols = 0;
+
+    foreach ($data['headers'] as $header) {
+        if (shpk_gforms_classify_col($header) !== 'product') continue;
+        $key = shpk_gforms_col_key($header);
+        if (isset($mapping[$key])) continue;
+
+        $product_name = shpk_gforms_extract_product_name($header);
+        $suggested_id = 0;
+
+        if ($product_name) {
+            $norm = mb_strtolower($product_name);
+            if (isset($wc_name_map[$norm])) {
+                $suggested_id = $wc_name_map[$norm];
+            } else {
+                foreach ($wc_name_map as $wc_norm => $wc_id) {
+                    if (mb_strpos($wc_norm, $norm) !== false || mb_strpos($norm, $wc_norm) !== false) {
+                        $suggested_id = $wc_id;
+                        break;
+                    }
+                }
+            }
+        }
+
+        $mapping[$key] = [
+            'col_header'    => $header,
+            'col_name'      => $product_name,
+            'wc_product_id' => $suggested_id,
+        ];
+        $new_cols++;
+    }
+
+    update_option('shpk_gf_mapping_' . $sheet_idx, $mapping);
+    if (ob_get_length()) ob_clean();
+    wp_send_json_success(['new_cols' => $new_cols, 'total' => count($mapping)]);
+});
+
+/* ── AJAX: product search ─────────────────────────────────── */
+add_action('wp_ajax_shpk_gforms_search_products', function () {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!current_user_can('manage_woocommerce')) { wp_send_json_error('unauthorized'); return; }
+    $q = sanitize_text_field($_GET['q'] ?? '');
+    if (mb_strlen($q) < 2) { wp_send_json_success([]); return; }
+    $products = wc_get_products(['search' => $q, 'limit' => 8, 'status' => 'publish']);
+    $results  = [];
+    foreach ($products as $p) {
+        $results[] = ['id' => $p->get_id(), 'name' => $p->get_name(), 'sku' => $p->get_sku()];
+    }
+    if (ob_get_length()) ob_clean();
+    wp_send_json_success($results);
+});
+
+/* ── AJAX: save single mapping entry ─────────────────────── */
+add_action('wp_ajax_shpk_gforms_save_mapping', function () {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!current_user_can('manage_woocommerce')) { wp_send_json_error('unauthorized'); return; }
+    $sheet_idx = absint($_POST['sheet_idx'] ?? 0);
+    $col_key   = sanitize_key($_POST['col_key'] ?? '');
+    $pid       = (int)($_POST['wc_product_id'] ?? 0);
+    if (!$col_key) { wp_send_json_error('missing key'); return; }
+    $mapping = get_option('shpk_gf_mapping_' . $sheet_idx, []);
+    if (!array_key_exists($col_key, $mapping)) { wp_send_json_error('key not found'); return; }
+    $mapping[$col_key]['wc_product_id'] = $pid;
+    update_option('shpk_gf_mapping_' . $sheet_idx, $mapping);
+    $name = $pid > 0 ? get_the_title($pid) : '';
+    if (ob_get_length()) ob_clean();
+    wp_send_json_success(['name' => $name]);
+});
+
+/* ── AJAX: import one order (one row per AJAX call) ──────── */
+add_action('wp_ajax_shpk_gforms_import_one', function () {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!current_user_can('manage_woocommerce')) { wp_send_json_error('unauthorized'); return; }
+    @set_time_limit(60);
+
+    $sheet_idx  = absint($_POST['sheet_idx'] ?? 0);
+    $offset     = absint($_POST['offset']    ?? 0);
+    $sheets     = get_option('shpk_gforms_sheets', []);
+    $sheet_name = $sheets[$sheet_idx]['name'] ?? ('גיליון ' . $sheet_idx);
+
+    $data = shpk_gforms_get_sheet_data($sheet_idx);
+    if (!$data) { wp_send_json_error('לא ניתן לגשת לגיליון'); return; }
+
+    $headers  = $data['headers'];
+    $all_rows = $data['rows'];
+    $mapping  = get_option('shpk_gf_mapping_' . $sheet_idx, []);
+
+    $ts_col = null;
+    foreach ($headers as $ci => $ch) {
+        if (shpk_gforms_classify_col($ch) === 'timestamp') { $ts_col = $ci; break; }
+    }
+
+    $checkpoint = (int)get_option('shpk_gf_checkpoint_' . $sheet_idx, 0);
+    $new_rows   = [];
+    foreach ($all_rows as $row) {
+        $ts_str = $ts_col !== null ? trim($row[$ts_col] ?? '') : '';
+        $dt     = $ts_str ? shpk_gforms_parse_timestamp($ts_str) : null;
+        $is_new = $dt ? ($dt->getTimestamp() > $checkpoint) : ($checkpoint === 0);
+        if ($is_new) $new_rows[] = $row;
+    }
+
+    $total = count($new_rows);
+    if ($offset >= $total) {
+        if (ob_get_length()) ob_clean();
+        wp_send_json_success(['done' => 0, 'skip' => 0, 'fail' => 0, 'finished' => true, 'next_offset' => $total, 'total' => $total]);
+        return;
+    }
+
+    $row      = $new_rows[$offset];
+    $next     = $offset + 1;
+    $finished = ($next >= $total);
+
+    $cust_name = $city = $phone = $email = '';
+    $notes     = [];
+    $name_seen = $city_seen = $phone_seen = false;
+
+    foreach ($headers as $ci => $h) {
+        $type = shpk_gforms_classify_col($h);
+        $val  = trim($row[$ci] ?? '');
+        if (!$val) continue;
+        if ($type === 'name'  && !$name_seen)  { $cust_name = $val; $name_seen  = true; }
+        if ($type === 'city'  && !$city_seen)  { $city      = $val; $city_seen  = true; }
+        if ($type === 'phone' && !$phone_seen) { $phone     = $val; $phone_seen = true; }
+        if ($type === 'email') $email = $val;
+        if ($type === 'notes') $notes[] = trim(preg_replace('/\s*\[[^\]]+\]\s*$/u', '', trim($h))) . ': ' . $val;
+    }
+
+    if (!$cust_name) {
+        if ($finished) shpk_gforms_update_checkpoint($sheet_idx, $new_rows, $ts_col);
+        if (ob_get_length()) ob_clean();
+        wp_send_json_success(['done' => 0, 'skip' => 1, 'fail' => 0, 'log' => 'שורה ללא שם', 'next_offset' => $next, 'total' => $total, 'finished' => $finished]);
+        return;
+    }
+
+    $items = [];
+    foreach ($headers as $ci => $h) {
+        if (shpk_gforms_classify_col($h) !== 'product') continue;
+        $val = trim($row[$ci] ?? '');
+        if (!$val || $val === '0' || !(float)$val) continue;
+        $col_key   = shpk_gforms_col_key($h);
+        $map_entry = $mapping[$col_key] ?? null;
+        if (!$map_entry) continue;
+        $pid = (int)($map_entry['wc_product_id'] ?? 0);
+        if ($pid <= 0) continue;
+        $product = wc_get_product($pid);
+        if ($product) $items[] = ['product' => $product, 'qty' => max(1, (float)$val)];
+    }
+
+    if (!$items) {
+        if ($finished) shpk_gforms_update_checkpoint($sheet_idx, $new_rows, $ts_col);
+        if (ob_get_length()) ob_clean();
+        wp_send_json_success(['done' => 0, 'skip' => 1, 'fail' => 0, 'log' => $cust_name . ' — ללא פריטים ממופים', 'next_offset' => $next, 'total' => $total, 'finished' => $finished]);
+        return;
+    }
+
+    try {
+        $order = wc_create_order();
+        $np    = explode(' ', $cust_name, 2);
+        $order->set_billing_first_name($np[0]);
+        $order->set_billing_last_name($np[1] ?? '');
+        $order->set_billing_city($city);
+        $order->set_billing_phone($phone);
+        $order->set_billing_country('IL');
+        if ($email) $order->set_billing_email($email);
+        foreach ($items as $item) $order->add_product($item['product'], $item['qty']);
+        if ($notes) $order->add_order_note('הערות לקוח: ' . implode(' | ', $notes));
+        $order->add_order_note('יובא מטופס: ' . $sheet_name);
+        $order->calculate_totals();
+        $order->update_status('processing');
+        $order->save();
+        if ($finished) shpk_gforms_update_checkpoint($sheet_idx, $new_rows, $ts_col);
+        if (ob_get_length()) ob_clean();
+        wp_send_json_success(['done' => 1, 'skip' => 0, 'fail' => 0, 'log' => $cust_name, 'order_id' => $order->get_id(), 'next_offset' => $next, 'total' => $total, 'finished' => $finished]);
+    } catch (Exception $e) {
+        if ($finished) shpk_gforms_update_checkpoint($sheet_idx, $new_rows, $ts_col);
+        if (ob_get_length()) ob_clean();
+        wp_send_json_success(['done' => 0, 'skip' => 0, 'fail' => 1, 'log' => $cust_name . ': ' . $e->getMessage(), 'next_offset' => $next, 'total' => $total, 'finished' => $finished]);
+    }
+});
