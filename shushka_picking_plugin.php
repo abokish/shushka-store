@@ -2,7 +2,7 @@
 /**
  * Plugin Name: שושקה — ניהול חנות
  * Description: ליקוט ומשלוח הזמנות — שושקה
- * Version: 5.4.0
+ * Version: 5.4.1
  */
 defined('ABSPATH') || exit;
 
