@@ -2,7 +2,7 @@
 /**
  * Plugin Name: שושקה — ניהול חנות
  * Description: ליקוט ומשלוח הזמנות — שושקה
- * Version: 5.4.1
+ * Version: 5.4.2
  */
 defined('ABSPATH') || exit;
 
@@ -4201,8 +4201,7 @@ function shpk_gforms_mapping_tab($sheet_idx, $nonce) {
 
         foreach ($mapping as $key => $entry) {
             $pid      = (int)($entry['wc_product_id'] ?? 0);
-            $col_name = esc_html($entry['col_name']   ?? '');
-            $col_hdr  = esc_attr($entry['col_header'] ?? '');
+            $col_name = esc_html($entry['col_name'] ?? '');
             $ek       = esc_attr($key);
 
             if ($pid > 0) {
@@ -4218,7 +4217,7 @@ function shpk_gforms_mapping_tab($sheet_idx, $nonce) {
             }
 
             echo '<tr data-key="' . $ek . '" data-status="' . $status_cls . '">';
-            echo '<td title="' . $col_hdr . '" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' . $col_name . '</td>';
+            echo '<td style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' . $col_name . '</td>';
             echo '<td id="shpk-gf-m-' . $ek . '" style="overflow:hidden">' . $match_html . '</td>';
             echo '<td>';
             echo '<div id="shpk-gf-a-' . $ek . '">';
@@ -4420,7 +4419,6 @@ add_action('wp_ajax_shpk_gforms_detect', function () {
         }
 
         $mapping[$key] = [
-            'col_header'    => mb_substr($header, 0, 30), // truncated — full header causes TEXT column overflow
             'col_name'      => $product_name,
             'wc_product_id' => $suggested_id,
         ];
