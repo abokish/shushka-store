@@ -4291,14 +4291,15 @@ function shpk_gforms_mapping_tab($sheet_idx, $nonce) {
     function shpkGfDetect(si,n){
         var btn=document.getElementById('shpk-gf-det-btn');
         var st=document.getElementById('shpk-gf-det-st');
-        btn.disabled=true; st.textContent='⏳ טוען גיליון...';
+        btn.disabled=true; st.innerHTML='&#9203; טוען גיליון...';
         fetch(ajaxurl,{method:'POST',body:new URLSearchParams({action:'shpk_gforms_detect',nonce:n,sheet_idx:si})})
         .then(function(r){return r.json();}).then(function(d){
             btn.disabled=false;
-            if(!d.success){st.textContent='✗ '+(d.data||'שגיאה');return;}
-            st.textContent='✓ נמצאו '+d.data.new_cols+' עמודות חדשות (סה"כ '+d.data.total+')';
-            if(d.data.new_cols>0||d.data.total>0) setTimeout(function(){location.reload();},600);
-        }).catch(function(){btn.disabled=false;st.textContent='שגיאת רשת';});
+            if(!d.success){st.innerHTML='<span style="color:#c00">&#x2717; '+(d.data||'שגיאה')+'</span>';return;}
+            st.innerHTML='<span style="color:#4caf50">&#x2714; נמצאו '+d.data.new_cols+' עמודות חדשות (סה"כ '+d.data.total+')</span>'
+                +'&nbsp;&nbsp;<button onclick="location.reload()" class="button button-primary button-small">&#8594; הצג עמודות למיפוי</button>';
+            setTimeout(function(){location.reload();},1800);
+        }).catch(function(){btn.disabled=false;st.innerHTML='<span style="color:#c00">שגיאת רשת</span>';});
     }
     </script>
     <?php
@@ -4378,7 +4379,14 @@ add_action('wp_ajax_shpk_gforms_detect', function () {
         $new_cols++;
     }
 
-    update_option('shpk_gf_mapping_' . $sheet_idx, $mapping);
+    // delete + add with autoload=no — avoids update_option returning false silently on large data
+    delete_option('shpk_gf_mapping_' . $sheet_idx);
+    $saved = add_option('shpk_gf_mapping_' . $sheet_idx, $mapping, '', 'no');
+    if (!$saved) {
+        if (ob_get_length()) ob_clean();
+        wp_send_json_error('שמירת המיפוי נכשלה — ' . count($mapping) . ' רשומות. בדוק הרשאות DB.');
+        return;
+    }
     if (ob_get_length()) ob_clean();
     wp_send_json_success(['new_cols' => $new_cols, 'total' => count($mapping)]);
 });
