@@ -24,3 +24,7 @@ shushka-css.zip
 # תיקיות
 footer-helper/
 shushka-css/
+node_modules/
+
+# ייצוא מלא של האתר (קבצים כבדים)
+WordPress.*.xml

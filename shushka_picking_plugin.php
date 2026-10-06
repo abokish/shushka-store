@@ -2,7 +2,7 @@
 /**
  * Plugin Name: שושקה — ניהול חנות
  * Description: ליקוט ומשלוח הזמנות — שושקה
- * Version: 5.4.3
+ * Version: 5.6.6
  */
 defined('ABSPATH') || exit;
 
@@ -188,6 +188,37 @@ function shpk_pin_settings() {
     submit_button('שמור קוד');
     echo '</form></div>';
 }
+
+/* ── ייצוא הזמנות נארזות — נגיש לקופאי (PIN) מכל עמוד ── */
+add_action('wp_loaded', function () {
+    if (($_GET['shpk_export'] ?? '') !== 'packed') return;
+    $pin    = get_option('shushka_pick_pin', '1234');
+    $pin_ok = isset($_COOKIE['shushka_pin']) && $_COOKIE['shushka_pin'] === md5($pin . AUTH_KEY);
+    if (!$pin_ok && !current_user_can('manage_woocommerce')) wp_die('אין הרשאה');
+    $orders = wc_get_orders(['status' => ['packed'], 'limit' => -1, 'orderby' => 'date', 'order' => 'ASC']);
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="shushka-packed-' . date('Ymd-His') . '.csv"');
+    header('Pragma: no-cache');
+    $out = fopen('php://output', 'w');
+    fputs($out, "\xEF\xBB\xBF");
+    fputcsv($out, ['מספר הזמנה', 'שם לקוח', 'ברקוד', 'שם מוצר', 'כמות', 'מחיר ליחידה', 'סה"כ שורה']);
+    $seq = 0;
+    foreach ($orders as $order) {
+        $seq++;
+        $cname = trim($order->get_billing_first_name() . ' ' . $order->get_billing_last_name());
+        foreach ($order->get_items() as $item) {
+            $product    = $item->get_product();
+            $sku        = $product ? $product->get_sku() : '';
+            $qty        = $item->get_quantity();
+            $unit_price = $qty > 0 ? round($item->get_total() / $qty, 2) : 0;
+            fputcsv($out, [$seq, $cname, $sku, $item->get_name(), $qty,
+                           number_format((float)$unit_price, 2, '.', ''),
+                           number_format((float)$item->get_total(), 2, '.', '')]);
+        }
+    }
+    fclose($out);
+    exit;
+});
 
 /* ── ייצוא CSV — admin_init (לפני פלט HTML) ─────────── */
 add_action('admin_init', function() {
@@ -482,6 +513,77 @@ function shpk_prices_page() {
         echo '<p><a href="' . $base . '" class="button">חזרה</a></p></div>'; return;
     }
 
+    // ── import customers from POS ────────────────────────
+    if (isset($_POST['shpk_import_customers'])) {
+        check_admin_referer('shpk_import_customers');
+        $tmp = $_FILES['shpk_customers_csv']['tmp_name'] ?? '';
+        if (!$tmp) {
+            echo '<div class="wrap" dir="rtl"><h1>🔄 סנכרון קופה</h1>';
+            echo '<div class="notice notice-error"><p>לא נבחר קובץ.</p></div>';
+            echo '<p><a href="' . $base . '" class="button">חזרה</a></p></div>'; return;
+        }
+        $raw   = ltrim(file_get_contents($tmp), "\xEF\xBB\xBF");
+        $lines = explode("\n", str_replace(["\r\n", "\r"], "\n", trim($raw)));
+        array_shift($lines); // skip header
+
+        $created = $updated = $skipped = $errors = [];
+
+        foreach ($lines as $line) {
+            $row = str_getcsv($line);
+            if (count($row) < 2) continue;
+            $code  = trim($row[0]);
+            $name  = trim($row[1]);
+            $email = isset($row[8]) ? trim($row[8]) : '';
+            $phone = isset($row[9]) ? trim($row[9]) : '';
+            if (!$code || !$name || $code === '999') { $skipped[] = $name ?: $code; continue; }
+
+            // normalize phone
+            $digits = preg_replace('/[^\d]/', '', $phone);
+            if (strlen($digits) === 9 && $digits[0] === '5') $digits = '0' . $digits;
+            if (strlen($digits) === 12 && substr($digits, 0, 3) === '972') $digits = '0' . substr($digits, 3);
+            $phone = $digits;
+
+            $use_email = $email ?: "pos_{$code}@shushka-pos.local";
+            $parts     = explode(' ', $name, 2);
+            $first     = $parts[0];
+            $last      = $parts[1] ?? '';
+
+            $existing = email_exists($use_email);
+            if ($existing) {
+                if (get_user_meta($existing, '_cashier_code', true) == $code) {
+                    $skipped[] = $name; continue;
+                }
+                update_user_meta($existing, '_cashier_code', $code);
+                if ($phone) update_user_meta($existing, 'billing_phone', $phone);
+                $updated[] = $name;
+            } else {
+                $user_id = wc_create_new_customer($use_email, "pos_{$code}", wp_generate_password(20, false));
+                if (is_wp_error($user_id)) { $errors[] = $name . ': ' . $user_id->get_error_message(); continue; }
+                wp_update_user(['ID' => $user_id, 'first_name' => $first, 'last_name' => $last]);
+                update_user_meta($user_id, 'billing_first_name', $first);
+                update_user_meta($user_id, 'billing_last_name',  $last);
+                update_user_meta($user_id, 'billing_phone',      $phone);
+                update_user_meta($user_id, '_cashier_code',      $code);
+                $created[] = $name;
+            }
+        }
+
+        echo '<div class="wrap" dir="rtl"><h1>🔄 סנכרון קופה</h1>';
+        echo '<div class="notice notice-success"><p>';
+        echo '✓ נוצרו: <strong>' . count($created) . '</strong> &nbsp;|&nbsp; ';
+        echo 'עודכנו: <strong>' . count($updated) . '</strong> &nbsp;|&nbsp; ';
+        echo 'דולגו: <strong>' . count($skipped) . '</strong>';
+        if ($errors) echo ' &nbsp;|&nbsp; שגיאות: <strong>' . count($errors) . '</strong>';
+        echo '</p></div>';
+        if ($errors) {
+            echo '<div class="notice notice-warning"><p>שגיאות:</p><ul>';
+            foreach ($errors as $e) echo '<li>' . esc_html($e) . '</li>';
+            echo '</ul></div>';
+        }
+        echo '<p><a href="' . $base . '" class="button button-primary">חזרה לסנכרון</a></p></div>';
+        return;
+    }
+
     // ── main page ────────────────────────────────────────
     if (!isset($_POST['shpk_prices_preview'])) {
         $packed_count = count(wc_get_orders(['status' => ['packed'], 'limit' => -1]));
@@ -637,6 +739,18 @@ function shpk_prices_page() {
         echo '<label style="font-size:15px;display:flex;align-items:center;gap:8px"><input type="checkbox" name="do_inactive" value="1" checked> <strong>זהה מוצרים לא פעילים</strong> <span style="color:#888;font-size:13px">— לא נמכרו מעל</span> <input type="number" name="inactive_months" value="12" min="1" max="60" style="width:55px;text-align:center"> <span style="color:#888;font-size:13px">חודשים</span></label>';
         echo '</div>';
         submit_button('📋 טען ותצוגה מקדימה', 'primary large');
+        echo '</form></div>';
+
+        // Section 3: import customers
+        echo '<div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:20px;margin-top:24px">';
+        echo '<h2 style="margin-top:0">👥 ייבוא לקוחות מהקופה</h2>';
+        echo '<p style="color:#555">העלה את קובץ ייצוא הלקוחות מהקופה (עמודות: קוד לקוח, שם, ..., אמייל, טלפון).<br>';
+        echo 'לקוחות קיימים ב-WooCommerce יקבלו קוד לקוח, חדשים ייווצרו אוטומטית. בטוח להריץ שוב — מדלג על קיימים.</p>';
+        echo '<form method="post" enctype="multipart/form-data">';
+        wp_nonce_field('shpk_import_customers');
+        echo '<input type="hidden" name="shpk_import_customers" value="1">';
+        echo '<input type="file" name="shpk_customers_csv" accept=".csv" required style="margin:12px 0;display:block;font-size:15px">';
+        submit_button('👥 ייבא לקוחות', 'secondary large');
         echo '</form></div>';
 
         echo '</div>';
@@ -928,6 +1042,8 @@ function shpk_css() { ?>
 .tab-btn{padding:7px 18px;border:2px solid #183625;border-radius:20px;background:#fff;color:#183625;cursor:pointer;font-size:13px;font-weight:600}
 .tab-btn.active,.tab-btn:hover{background:#183625;color:#fff}
 .pbtn{padding:7px 18px;border-radius:20px;background:#555;color:#fff;border:none;cursor:pointer;font-size:13px}
+.pbtn-export{background:#183625}
+.export-badge{display:inline-block;background:#ff9800;color:#fff;border-radius:10px;font-size:11px;font-weight:700;padding:1px 6px;margin-right:4px;vertical-align:middle}
 .view{display:none}.view.active{display:block}
 .oc{border:1px solid #ddd;border-radius:10px;margin-bottom:14px;overflow:hidden;transition:opacity .3s}
 .oc.picking .oc-hd{background:#fff3e0}
@@ -942,15 +1058,20 @@ function shpk_css() { ?>
 .hd-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 .btn-start{padding:5px 14px;border-radius:16px;border:2px solid #ff9800;background:#fff;color:#ff9800;cursor:pointer;font-size:13px;font-weight:600}
 .btn-start:hover{background:#ff9800;color:#fff}
+.btn-all{padding:5px 12px;border-radius:16px;border:2px solid #183625;background:#fff;color:#183625;cursor:pointer;font-size:13px;font-weight:600}
+.btn-all:hover{background:#183625;color:#fff}
 .btn-pack{padding:5px 14px;border-radius:16px;border:none;background:#4caf50;color:#fff;cursor:pointer;font-size:13px;font-weight:600}
 .btn-pack:disabled{background:#aaa;cursor:default}
+.btn-unpack{padding:5px 14px;border-radius:16px;border:2px solid #9e9e9e;background:#fff;color:#666;cursor:pointer;font-size:13px;font-weight:600}
+.btn-unpack:hover{background:#9e9e9e;color:#fff}
 .oc-items{padding:0;margin:0;list-style:none}
 .oc-item{display:flex;align-items:center;gap:10px;padding:8px 14px;border-top:1px solid #eee;transition:opacity .2s}
 .oc-item:nth-child(even){background:#fafafa}
 .oc-item.missing{opacity:.4;background:#fff5f5}
 .ic{width:20px;height:20px;cursor:pointer;flex-shrink:0;accent-color:#183625}
-.iname{flex:1;font-size:14px}
-.iname.done{text-decoration:line-through;color:#bbb}
+.iname{flex:1;font-size:14px;color:inherit;text-decoration:none}
+.iname[href]:hover{text-decoration:underline;color:#183625}
+.iname.done,.iname.done:hover{text-decoration:line-through;color:#bbb}
 .iqty-wrap{display:flex;align-items:center;gap:4px;flex-shrink:0}
 .iqty-lbl{font-size:12px;color:#888}
 .iqty{width:58px;padding:3px 6px;border:1px solid #ccc;border-radius:6px;font-size:14px;font-weight:700;color:#183625;text-align:center}
@@ -958,6 +1079,8 @@ function shpk_css() { ?>
 .iqty.changed{background:#fff8e1;border-color:#ff9800}
 .iqty-orig{font-size:11px;color:#bbb}
 .isku{font-size:11px;color:#ccc;flex-shrink:0}
+.iprice{font-size:12px;color:#888;background:#f5f5f5;border-radius:10px;padding:1px 7px;flex-shrink:0;white-space:nowrap}
+.cprice{color:#555;font-size:13px}
 .ct{width:100%;border-collapse:collapse;font-size:14px}
 .ct th{background:#183625;color:#fff;padding:8px 12px;text-align:right}
 .ct td{padding:8px 12px;border-bottom:1px solid #eee}
@@ -1046,17 +1169,20 @@ function shpk_pick_page($frontend = false) {
     if (!shpk_check_pin()) { shpk_pin_form('כניסה לדף הליקוט'); return; }
     $ajax_url = admin_url('admin-ajax.php');
     $nonce  = wp_create_nonce('shushka_nonce');
-    $orders = wc_get_orders(array('status' => array('processing','picking'),'limit' => -1,'orderby' => 'date','order' => 'ASC'));
+    $orders       = wc_get_orders(array('status' => array('processing','picking','packed'),'limit' => -1,'orderby' => 'date','order' => 'ASC'));
+    $packed_count = count(array_filter($orders, fn($o) => $o->get_status() === 'packed'));
+    $export_url   = esc_url(add_query_arg('shpk_export', 'packed', home_url('/')));
     $dk     = date('Ymd');
     $ds     = date_i18n('j/n/Y');
-    $total  = count($orders);
+    $total  = count($orders) - $packed_count;
 
     $cmap = array();
     foreach ($orders as $ord) {
+        if ($ord->get_status() === 'packed') continue;
         foreach ($ord->get_items() as $item) {
             $p=$item->get_product(); $name=$item->get_name(); $qty=(int)$item->get_quantity();
-            $sku=$p?$p->get_sku():''; $key=$sku?:$name;
-            if(!isset($cmap[$key])) $cmap[$key]=array('name'=>$name,'sku'=>$sku,'total'=>0,'orders'=>array());
+            $sku=$p?$p->get_sku():''; $price=$p?(float)$p->get_price():0; $key=$sku?:$name;
+            if(!isset($cmap[$key])) $cmap[$key]=array('name'=>$name,'sku'=>$sku,'price'=>$price,'total'=>0,'orders'=>array());
             $cmap[$key]['total']+=$qty; $cmap[$key]['orders'][]=$ord->get_order_number();
         }
     }
@@ -1070,6 +1196,7 @@ function shpk_pick_page($frontend = false) {
             <button class="tab-btn active" onclick="showTab('orders',this)">לפי הזמנה</button>
             <button class="tab-btn"        onclick="showTab('consol',this)">מרוכז לפי מוצר</button>
             <button class="pbtn"           onclick="window.print()">🖨️ הדפס</button>
+            <a href="<?php echo $export_url; ?>" class="pbtn pbtn-export" style="text-decoration:none">⬇ ייצוא לקופה<?php if($packed_count): ?> <span class="export-badge"><?php echo $packed_count; ?></span><?php endif; ?></a>
         </div>
 
         <div id="view-orders" class="view active">
@@ -1091,10 +1218,12 @@ function shpk_pick_page($frontend = false) {
                         <button class="btn-start" onclick="setSt(<?php echo $oid; ?>,'picking',this)">▶ התחל ליקוט</button>
                     <?php elseif($st==='picking'): ?>
                         <span class="oc-badge badge-picking">בליקוט</span>
+                        <button class="btn-all" id="all-<?php echo $oid; ?>" onclick="checkAll(<?php echo $oid; ?>,this)">☑ הכל</button>
                         <button class="mob-pick-btn" onclick="enterPickMode(<?php echo $oid; ?>)">📱 ליקוט</button>
                         <button class="btn-pack" onclick="packOrder(<?php echo $oid; ?>,this)">✓ סמן כנארז</button>
                     <?php else: ?>
                         <span class="oc-badge badge-packed">נארז ✓</span>
+                        <button class="btn-unpack" onclick="setSt(<?php echo $oid; ?>,'picking',this)">↩ החזר לליקוט</button>
                     <?php endif; ?>
                 </div>
             </div>
@@ -1102,6 +1231,7 @@ function shpk_pick_page($frontend = false) {
             <?php foreach ($ord->get_items() as $iid => $item):
                 $p=$item->get_product(); $sku=$p?$p->get_sku():'';
                 $qty=(int)$item->get_quantity(); $nm=$item->get_name();
+                $unit_price=$p?(float)$p->get_price():0;
                 $ck="ck_{$dk}_{$oid}_{$iid}"; $qk="qty_{$dk}_{$oid}_{$iid}";
             ?>
             <li class="oc-item" id="li_<?php echo $ck; ?>">
@@ -1110,8 +1240,10 @@ function shpk_pick_page($frontend = false) {
                     data-oid="<?php echo $oid; ?>"
                     data-iid="<?php echo $iid; ?>"
                     data-name="<?php echo esc_attr($nm); ?>">
-                <span class="iname" id="nm_<?php echo $ck; ?>"><?php echo esc_html($nm); ?></span>
+                <?php $purl=$p?get_permalink($p->get_id()):''; ?>
+                <a class="iname" id="nm_<?php echo $ck; ?>" <?php if($purl): ?>href="<?php echo esc_url($purl); ?>" target="_blank"<?php endif; ?>><?php echo esc_html($nm); ?></a>
                 <?php if($sku): ?><span class="isku"><?php echo esc_html($sku); ?></span><?php endif; ?>
+                <?php if($unit_price > 0): ?><span class="iprice">₪<?php echo number_format($unit_price, 2); ?></span><?php endif; ?>
                 <div class="iqty-wrap">
                     <span class="iqty-lbl">כמות:</span>
                     <input class="iqty" type="number" step="0.01" min="0"
@@ -1134,10 +1266,11 @@ function shpk_pick_page($frontend = false) {
         <div id="view-consol" class="view">
         <?php if($cmap): ?>
         <table class="ct">
-            <thead><tr><th>מוצר</th><th>ברקוד</th><th>סה"כ כמות</th><th>הזמנות</th></tr></thead>
+            <thead><tr><th>מוצר</th><th>ברקוד</th><th>מחיר</th><th>סה"כ כמות</th><th>הזמנות</th></tr></thead>
             <tbody>
             <?php foreach($cmap as $d): ?>
             <tr><td><?php echo esc_html($d['name']); ?></td><td><?php echo esc_html($d['sku']); ?></td>
+            <td class="cprice"><?php echo $d['price']>0 ? '₪'.number_format($d['price'],2) : ''; ?></td>
             <td class="cq"><?php echo $d['total']; ?></td><td class="co">#<?php echo implode(', #',$d['orders']); ?></td></tr>
             <?php endforeach; ?>
             </tbody>
@@ -1221,7 +1354,7 @@ function shpk_pick_page($frontend = false) {
             if (!d.success) { btn.disabled = false; btn.textContent = 'שגיאה'; return; }
             var card = document.getElementById('oc-' + oid);
             card.className = 'oc packed';
-            card.querySelector('.hd-actions').innerHTML = '<span class="oc-badge badge-packed">נארז ✓</span>';
+            card.querySelector('.hd-actions').innerHTML = '<span class="oc-badge badge-packed">נארז ✓</span><button class="btn-unpack" onclick="setSt(' + oid + ',\'picking\',this)">↩ החזר לליקוט</button>';
             if (_pmOid === oid) exitPickMode();
         });
     }
@@ -1238,6 +1371,7 @@ function shpk_pick_page($frontend = false) {
             card.className = 'oc ' + status;
             card.querySelector('.hd-actions').innerHTML =
                 '<span class="oc-badge badge-picking">בליקוט</span>' +
+                '<button class="btn-all" id="all-' + oid + '" onclick="checkAll(' + oid + ',this)">☑ הכל</button>' +
                 '<button class="mob-pick-btn" onclick="enterPickMode(' + oid + ')">📱 ליקוט</button>' +
                 '<button class="btn-pack" onclick="packOrder(' + oid + ',this)">✓ סמן כנארז</button>';
             if (window.innerWidth <= 700) enterPickMode(oid);
@@ -1261,6 +1395,23 @@ function shpk_pick_page($frontend = false) {
         ordersDiv.querySelectorAll('.oc').forEach(function(c){ c.classList.remove('active-pick'); });
         document.getElementById('pick-bottom').classList.remove('active');
         document.querySelector('.sp').classList.remove('pick-mode-active');
+    }
+    function checkAll(oid, btn) {
+        var cbs = Array.from(document.querySelectorAll('.ic[data-oid="' + oid + '"]'));
+        var allChecked = cbs.every(function(cb) { return cb.checked; });
+        cbs.forEach(function(cb) {
+            cb.checked = !allChecked;
+            if (cb.checked) {
+                var li = document.getElementById('li_' + cb.id);
+                if (li) li.classList.remove('missing');
+                var nm = document.getElementById('nm_' + cb.id);
+                if (nm) nm.classList.remove('done');
+            } else {
+                shpkApplyUncheck(cb);
+            }
+            localStorage.setItem(cb.id, cb.checked ? '1' : '0');
+        });
+        if (btn) btn.textContent = allChecked ? '☑ הכל' : '☐ בטל הכל';
     }
     function packFromPickMode() {
         if (!_pmOid) return;
@@ -3893,6 +4044,30 @@ add_action('admin_menu', function () {
 
 /* ── helpers ──────────────────────────────────────────────── */
 
+/**
+ * Save the column-to-product mapping using raw SQL to bypass WordPress's
+ * charset/length validation, which rejects Hebrew text in maybe_serialize().
+ * Mapping: [ col_key (md5 hex) => ['p'=>pid, 'p2'=>pid2, 's2'=>size2] ]
+ * p2/s2 optional — used for large-package split (e.g. 1 kg vs 2 kg bags)
+ */
+function shpk_gf_save_mapping($sheet_idx, $mapping) {
+    global $wpdb;
+    $opt = 'shpk_gf_mapping_' . (int)$sheet_idx;
+    $wpdb->query(sprintf(
+        "REPLACE INTO `%s` (`option_name`, `option_value`, `autoload`) VALUES ('%s', '%s', 'no')",
+        $wpdb->options,
+        esc_sql($opt),
+        esc_sql(maybe_serialize($mapping))
+    ));
+    wp_cache_delete($opt, 'options');
+    $alloptions = wp_cache_get('alloptions', 'options');
+    if (is_array($alloptions)) { unset($alloptions[$opt]); wp_cache_set('alloptions', $alloptions, 'options'); }
+}
+
+function shpk_gf_get_mapping($sheet_idx) {
+    return get_option('shpk_gf_mapping_' . (int)$sheet_idx, []);
+}
+
 function shpk_gforms_sheet_csv_url($url) {
     if (preg_match('/\/d\/([a-zA-Z0-9_-]+)/', $url, $m))
         return 'https://docs.google.com/spreadsheets/d/' . $m[1] . '/export?format=csv';
@@ -4144,12 +4319,12 @@ function shpk_gforms_mapping_tab($sheet_idx, $nonce) {
     $sheet  = $sheets[$sheet_idx] ?? null;
     if (!$sheet) { echo '<div class="notice notice-error"><p>גיליון לא נמצא.</p></div>'; return; }
 
-    $mapping    = get_option('shpk_gf_mapping_' . $sheet_idx, []);
+    $mapping    = shpk_gf_get_mapping($sheet_idx);
     $checkpoint = (int)get_option('shpk_gf_checkpoint_' . $sheet_idx, 0);
 
     $cnt_mapped = $cnt_skip = $cnt_unmapped = 0;
     foreach ($mapping as $e) {
-        $pid = (int)($e['wc_product_id'] ?? 0);
+        $pid = is_array($e) ? (int)($e['p'] ?? 0) : (int)$e;
         if ($pid > 0) $cnt_mapped++;
         elseif ($pid === -1) $cnt_skip++;
         else $cnt_unmapped++;
@@ -4195,20 +4370,39 @@ function shpk_gforms_mapping_tab($sheet_idx, $nonce) {
         }
         echo '</div>';
 
+        // Re-derive column names from cached sheet data (Hebrew stays out of the DB)
+        $key_to_name = [];
+        $sdata = shpk_gforms_get_sheet_data($sheet_idx);
+        if ($sdata) {
+            foreach ($sdata['headers'] as $_h) {
+                if (shpk_gforms_classify_col($_h) === 'product')
+                    $key_to_name[shpk_gforms_col_key($_h)] = shpk_gforms_extract_product_name($_h);
+            }
+        }
+
         echo '<table class="wp-list-table widefat fixed striped" id="shpk-gf-map-tbl" style="table-layout:fixed">';
         echo '<colgroup><col style="width:38%"><col style="width:35%"><col style="width:27%"></colgroup>';
         echo '<thead><tr><th>שם מוצר מהטופס</th><th>מוצר ב-WooCommerce</th><th>פעולות</th></tr></thead><tbody>';
 
-        foreach ($mapping as $key => $entry) {
-            $pid      = (int)($entry['wc_product_id'] ?? 0);
-            $col_name = esc_html($entry['col_name'] ?? '');
+        foreach ($mapping as $key => $e) {
+            $pid1     = is_array($e) ? (int)($e['p']  ?? 0) : (int)$e;
+            $pid2     = is_array($e) ? (int)($e['p2'] ?? 0) : 0;
+            $sz2      = is_array($e) ? max(2, (int)($e['s2'] ?? 2)) : 2;
+            $col_name = esc_html($key_to_name[$key] ?? '(עמודה לא נמצאה)');
             $ek       = esc_attr($key);
 
-            if ($pid > 0) {
-                $wc_nm      = esc_html(get_the_title($pid));
-                $match_html = '<span style="color:#4caf50">&#10003; ' . $wc_nm . '</span>';
+            if ($pid1 > 0) {
+                $wc_nm1     = esc_html(get_the_title($pid1));
+                $match_html = '<span style="color:#4caf50">&#10003; ' . $wc_nm1 . '</span>';
+                if ($pid2 > 0) {
+                    $wc_nm2      = esc_html(get_the_title($pid2));
+                    $match_html .= '<br><span style="color:#1976d2;font-size:12px">&#128230; ' . $sz2 . ' ק"ג: ' . $wc_nm2
+                        . ' <a href="#" onclick="shpkGfClearP2(\'' . $ek . '\',' . $esi . ',\'' . $en . '\');return false" style="color:#c00;margin-right:4px;font-size:11px">&#10005;</a></span>';
+                } else {
+                    $match_html .= '<br><a href="#" onclick="shpkGfShowP2Src(\'' . $ek . '\');return false" style="color:#aaa;font-size:12px">+ הוסף חבילה גדולה</a>';
+                }
                 $status_cls = 'mapped';
-            } elseif ($pid === -1) {
+            } elseif ($pid1 === -1) {
                 $match_html = '<span style="color:#aaa">&#8212; דלג</span>';
                 $status_cls = 'skip';
             } else {
@@ -4218,20 +4412,28 @@ function shpk_gforms_mapping_tab($sheet_idx, $nonce) {
 
             echo '<tr data-key="' . $ek . '" data-status="' . $status_cls . '">';
             echo '<td style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' . $col_name . '</td>';
-            echo '<td id="shpk-gf-m-' . $ek . '" style="overflow:hidden">' . $match_html . '</td>';
-            echo '<td>';
+            echo '<td id="shpk-gf-m-' . $ek . '" style="overflow:hidden;vertical-align:top;padding-top:8px">' . $match_html . '</td>';
+            echo '<td style="vertical-align:top;padding-top:8px">';
             echo '<div id="shpk-gf-a-' . $ek . '">';
-            if ($pid !== -1) {
-                echo '<button onclick="shpkGfShowSrc(\'' . $ek . '\',' . $esi . ',\'' . $en . '\')" class="button button-small">' . ($pid > 0 ? 'שנה' : 'חפש') . '</button> ';
+            if ($pid1 !== -1) {
+                echo '<button onclick="shpkGfShowSrc(\'' . $ek . '\',' . $esi . ',\'' . $en . '\')" class="button button-small">' . ($pid1 > 0 ? 'שנה' : 'חפש') . '</button> ';
                 echo '<button onclick="shpkGfSaveMap(\'' . $ek . '\',-1,' . $esi . ',\'' . $en . '\')" class="button button-small" style="color:#888">דלג</button>';
             } else {
                 echo '<button onclick="shpkGfSaveMap(\'' . $ek . '\',0,' . $esi . ',\'' . $en . '\')" class="button button-small">בטל</button>';
             }
             echo '</div>';
+            // Primary product search box
             echo '<div id="shpk-gf-s-' . $ek . '" style="display:none;margin-top:4px">';
             echo '<input type="text" placeholder="חיפוש מוצר..." onkeyup="shpkGfSearch(\'' . $ek . '\',this.value,' . $esi . ',\'' . $en . '\')" style="width:100%;font-size:13px" autocomplete="off">';
             echo '<div id="shpk-gf-r-' . $ek . '" style="background:#fff;border:1px solid #ddd;border-radius:4px;max-height:150px;overflow-y:auto;margin-top:3px"></div>';
             echo '<button onclick="document.getElementById(\'shpk-gf-s-' . $ek . '\').style.display=\'none\'" class="button button-small" style="margin-top:3px;font-size:11px">סגור</button>';
+            echo '</div>';
+            // Large-package search box
+            echo '<div id="shpk-gf-p2s-' . $ek . '" style="display:none;margin-top:6px;border-top:1px solid #eee;padding-top:6px">';
+            echo '<div style="font-size:12px;color:#555;margin-bottom:4px">&#128230; חבילה גדולה — גודל: <input type="number" id="shpk-gf-sz-' . $ek . '" value="' . $sz2 . '" min="2" max="20" style="width:45px;font-size:12px" title="כמה ק&quot;ג מייצגת האריזה הגדולה"> ק"ג</div>';
+            echo '<input type="text" placeholder="חיפוש מוצר לחבילה גדולה..." onkeyup="shpkGfSearchP2(\'' . $ek . '\',this.value,' . $esi . ',\'' . $en . '\')" style="width:100%;font-size:13px" autocomplete="off">';
+            echo '<div id="shpk-gf-p2r-' . $ek . '" style="background:#fff;border:1px solid #ddd;border-radius:4px;max-height:150px;overflow-y:auto;margin-top:3px"></div>';
+            echo '<button onclick="document.getElementById(\'shpk-gf-p2s-' . $ek . '\').style.display=\'none\'" class="button button-small" style="margin-top:3px;font-size:11px">סגור</button>';
             echo '</div>';
             echo '</td></tr>';
         }
@@ -4285,7 +4487,8 @@ function shpk_gforms_mapping_tab($sheet_idx, $nonce) {
             var tr=document.querySelector('tr[data-key="'+key+'"]');
             if(pid>0){
                 var nm=pname||(d.data&&d.data.name)||pid;
-                mc.innerHTML='<span style="color:#4caf50">✓ '+nm+'</span>';
+                mc.innerHTML='<span style="color:#4caf50">✓ '+nm+'</span>'+
+                    '<br><a href="#" onclick="shpkGfShowP2Src(\''+key+'\');return false" style="color:#aaa;font-size:12px">+ הוסף חבילה גדולה</a>';
                 ac.innerHTML='<button onclick="shpkGfShowSrc(\''+key+'\','+si+',\''+n+'\')" class="button button-small">שנה</button> '+
                     '<button onclick="shpkGfSaveMap(\''+key+'\',-1,'+si+',\''+n+'\')" class="button button-small" style="color:#888">דלג</button>';
                 tr.dataset.status='mapped';
@@ -4298,6 +4501,55 @@ function shpk_gforms_mapping_tab($sheet_idx, $nonce) {
                 ac.innerHTML='<button onclick="shpkGfShowSrc(\''+key+'\','+si+',\''+n+'\')" class="button button-small">חפש</button> '+
                     '<button onclick="shpkGfSaveMap(\''+key+'\',-1,'+si+',\''+n+'\')" class="button button-small" style="color:#888">דלג</button>';
                 tr.dataset.status='unmapped';
+            }
+        });
+    }
+    function shpkGfShowP2Src(key){
+        document.getElementById('shpk-gf-p2s-'+key).style.display='';
+        document.getElementById('shpk-gf-p2s-'+key).querySelector('input[type=text]').focus();
+    }
+    function shpkGfSearchP2(key,q,si,n){
+        clearTimeout(shpkGfT[key+'_p2']);
+        var rd=document.getElementById('shpk-gf-p2r-'+key);
+        if(q.length<2){rd.innerHTML='';return;}
+        shpkGfT[key+'_p2']=setTimeout(function(){
+            fetch(ajaxurl+'?action=shpk_gforms_search_products&nonce='+n+'&q='+encodeURIComponent(q))
+            .then(function(r){return r.json();}).then(function(d){
+                if(!d.success)return;
+                rd.innerHTML=d.data.length?d.data.map(function(p){
+                    var pn=p.name.replace(/'/g,"\\'");
+                    return '<div onclick="shpkGfSelP2(\''+key+'\','+p.id+',\''+pn+'\','+si+',\''+n+'\')" '+
+                           'style="padding:5px 10px;cursor:pointer;border-bottom:1px solid #f0f0f0;font-size:13px" '+
+                           'onmouseover="this.style.background=\'#f5f5f5\'" onmouseout="this.style.background=\'\'">'+
+                           '<strong>'+p.name+'</strong> <span style="color:#aaa;font-size:11px">'+p.sku+'</span></div>';
+                }).join(''):'<div style="padding:8px;color:#888;font-size:13px">לא נמצאו תוצאות</div>';
+            });
+        },280);
+    }
+    function shpkGfSelP2(key,pid2,pname,si,n){
+        document.getElementById('shpk-gf-p2s-'+key).style.display='none';
+        var sz2=parseInt(document.getElementById('shpk-gf-sz-'+key).value)||2;
+        shpkGfSaveP2(key,pid2,sz2,si,n,pname);
+    }
+    function shpkGfClearP2(key,si,n){
+        shpkGfSaveP2(key,0,0,si,n,'');
+    }
+    function shpkGfSaveP2(key,pid2,sz2,si,n,pname){
+        fetch(ajaxurl,{method:'POST',body:new URLSearchParams({action:'shpk_gforms_save_mapping_p2',nonce:n,sheet_idx:si,col_key:key,pid2:pid2,sz2:sz2})})
+        .then(function(r){return r.json();}).then(function(d){
+            if(!d.success)return;
+            var mc=document.getElementById('shpk-gf-m-'+key);
+            var cur=mc.querySelector('span');
+            var nm1=cur?cur.textContent:'';
+            if(pid2>0){
+                var nm2=pname||(d.data&&d.data.name2)||pid2;
+                var s2=d.data&&d.data.sz2||sz2;
+                mc.innerHTML='<span style="color:#4caf50">'+nm1+'</span>'+
+                    '<br><span style="color:#1976d2;font-size:12px">📦 '+s2+' ק"ג: '+nm2+
+                    ' <a href="#" onclick="shpkGfClearP2(\''+key+'\','+si+',\''+n+'\');return false" style="color:#c00;margin-right:4px;font-size:11px">✕</a></span>';
+            } else {
+                mc.innerHTML='<span style="color:#4caf50">'+nm1+'</span>'+
+                    '<br><a href="#" onclick="shpkGfShowP2Src(\''+key+'\');return false" style="color:#aaa;font-size:12px">+ הוסף חבילה גדולה</a>';
             }
         });
     }
@@ -4393,7 +4645,7 @@ add_action('wp_ajax_shpk_gforms_detect', function () {
         $wc_name_map[mb_strtolower(trim($r->post_title))] = (int)$r->ID;
     }
 
-    $mapping  = get_option('shpk_gf_mapping_' . $sheet_idx, []);
+    $mapping  = shpk_gf_get_mapping($sheet_idx);
     $new_cols = 0;
 
     foreach ($data['headers'] as $header) {
@@ -4418,31 +4670,11 @@ add_action('wp_ajax_shpk_gforms_detect', function () {
             }
         }
 
-        $mapping[$key] = [
-            'col_name'      => $product_name,
-            'wc_product_id' => $suggested_id,
-        ];
+        $mapping[$key] = ['p' => (int)$suggested_id];
         $new_cols++;
     }
 
-    // REPLACE INTO bypasses WP object-cache (Redis/Memcached) and update_option quirks
-    global $wpdb;
-    $opt_name = 'shpk_gf_mapping_' . $sheet_idx;
-    $result = $wpdb->replace(
-        $wpdb->options,
-        ['option_name' => $opt_name, 'option_value' => maybe_serialize($mapping), 'autoload' => 'no'],
-        ['%s', '%s', '%s']
-    );
-    // Bust WP's in-memory option cache so the next get_option reads from DB
-    wp_cache_delete($opt_name, 'options');
-    $alloptions = wp_cache_get('alloptions', 'options');
-    if (is_array($alloptions)) { unset($alloptions[$opt_name]); wp_cache_set('alloptions', $alloptions, 'options'); }
-
-    if ($result === false) {
-        if (ob_get_length()) ob_clean();
-        wp_send_json_error('שגיאת DB: ' . $wpdb->last_error);
-        return;
-    }
+    shpk_gf_save_mapping($sheet_idx, $mapping);
     if (ob_get_length()) ob_clean();
     wp_send_json_success(['new_cols' => $new_cols, 'total' => count($mapping)]);
 });
@@ -4453,10 +4685,19 @@ add_action('wp_ajax_shpk_gforms_search_products', function () {
     if (!current_user_can('manage_woocommerce')) { wp_send_json_error('unauthorized'); return; }
     $q = sanitize_text_field($_GET['q'] ?? '');
     if (mb_strlen($q) < 2) { wp_send_json_success([]); return; }
-    $products = wc_get_products(['search' => $q, 'limit' => 8, 'status' => 'publish']);
-    $results  = [];
-    foreach ($products as $p) {
-        $results[] = ['id' => $p->get_id(), 'name' => $p->get_name(), 'sku' => $p->get_sku()];
+    global $wpdb;
+    $like = '%' . $wpdb->esc_like($q) . '%';
+    $rows = $wpdb->get_results($wpdb->prepare(
+        "SELECT p.ID, p.post_title,
+                (SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id=p.ID AND meta_key='_sku' LIMIT 1) AS sku
+         FROM {$wpdb->posts} p
+         WHERE p.post_type='product' AND p.post_status='publish' AND p.post_title LIKE %s
+         ORDER BY p.post_title LIMIT 10",
+        $like
+    ));
+    $results = [];
+    foreach ($rows as $r) {
+        $results[] = ['id' => (int)$r->ID, 'name' => $r->post_title, 'sku' => (string)$r->sku];
     }
     if (ob_get_length()) ob_clean();
     wp_send_json_success($results);
@@ -4470,13 +4711,40 @@ add_action('wp_ajax_shpk_gforms_save_mapping', function () {
     $col_key   = sanitize_key($_POST['col_key'] ?? '');
     $pid       = (int)($_POST['wc_product_id'] ?? 0);
     if (!$col_key) { wp_send_json_error('missing key'); return; }
-    $mapping = get_option('shpk_gf_mapping_' . $sheet_idx, []);
+    $mapping = shpk_gf_get_mapping($sheet_idx);
     if (!array_key_exists($col_key, $mapping)) { wp_send_json_error('key not found'); return; }
-    $mapping[$col_key]['wc_product_id'] = $pid;
-    update_option('shpk_gf_mapping_' . $sheet_idx, $mapping);
+    $cur = is_array($mapping[$col_key]) ? $mapping[$col_key] : [];
+    $cur['p'] = $pid;
+    $mapping[$col_key] = $cur;
+    shpk_gf_save_mapping($sheet_idx, $mapping);
     $name = $pid > 0 ? get_the_title($pid) : '';
     if (ob_get_length()) ob_clean();
     wp_send_json_success(['name' => $name]);
+});
+
+/* ── AJAX: save large-package (p2) for a column ─────────── */
+add_action('wp_ajax_shpk_gforms_save_mapping_p2', function () {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!current_user_can('manage_woocommerce')) { wp_send_json_error('unauthorized'); return; }
+    $sheet_idx = absint($_POST['sheet_idx'] ?? 0);
+    $col_key   = sanitize_key($_POST['col_key'] ?? '');
+    $pid2      = (int)($_POST['pid2'] ?? 0);
+    $sz2       = max(2, (int)($_POST['sz2'] ?? 2));
+    if (!$col_key) { wp_send_json_error('missing key'); return; }
+    $mapping = shpk_gf_get_mapping($sheet_idx);
+    if (!array_key_exists($col_key, $mapping)) { wp_send_json_error('key not found'); return; }
+    $cur = is_array($mapping[$col_key]) ? $mapping[$col_key] : ['p' => (int)$mapping[$col_key]];
+    if ($pid2 > 0) {
+        $cur['p2'] = $pid2;
+        $cur['s2'] = $sz2;
+    } else {
+        unset($cur['p2'], $cur['s2']);
+    }
+    $mapping[$col_key] = $cur;
+    shpk_gf_save_mapping($sheet_idx, $mapping);
+    $name2 = $pid2 > 0 ? get_the_title($pid2) : '';
+    if (ob_get_length()) ob_clean();
+    wp_send_json_success(['name2' => $name2, 'sz2' => $sz2]);
 });
 
 /* ── AJAX: import one order (one row per AJAX call) ──────── */
@@ -4495,7 +4763,7 @@ add_action('wp_ajax_shpk_gforms_import_one', function () {
 
     $headers  = $data['headers'];
     $all_rows = $data['rows'];
-    $mapping  = get_option('shpk_gf_mapping_' . $sheet_idx, []);
+    $mapping  = shpk_gf_get_mapping($sheet_idx);
 
     $ts_col = null;
     foreach ($headers as $ci => $ch) {
@@ -4549,13 +4817,25 @@ add_action('wp_ajax_shpk_gforms_import_one', function () {
         if (shpk_gforms_classify_col($h) !== 'product') continue;
         $val = trim($row[$ci] ?? '');
         if (!$val || $val === '0' || !(float)$val) continue;
-        $col_key   = shpk_gforms_col_key($h);
-        $map_entry = $mapping[$col_key] ?? null;
-        if (!$map_entry) continue;
-        $pid = (int)($map_entry['wc_product_id'] ?? 0);
-        if ($pid <= 0) continue;
-        $product = wc_get_product($pid);
-        if ($product) $items[] = ['product' => $product, 'qty' => max(1, (float)$val)];
+        $col_key = shpk_gforms_col_key($h);
+        $entry   = $mapping[$col_key] ?? null;
+        if ($entry === null) continue;
+        $pid1 = is_array($entry) ? (int)($entry['p']  ?? 0) : (int)$entry;
+        $pid2 = is_array($entry) ? (int)($entry['p2'] ?? 0) : 0;
+        $sz2  = is_array($entry) ? max(2, (int)($entry['s2'] ?? 2)) : 2;
+        if ($pid1 <= 0) continue;
+        $qty = (int)(float)$val;
+        if ($qty <= 0) continue;
+        if ($pid2 > 0) {
+            // Split: as many large packages as possible, remainder in small
+            $bags_large = intdiv($qty, $sz2);
+            $bags_small = $qty % $sz2;
+            if ($bags_large > 0) { $p = wc_get_product($pid2); if ($p) $items[] = ['product' => $p, 'qty' => $bags_large]; }
+            if ($bags_small > 0) { $p = wc_get_product($pid1); if ($p) $items[] = ['product' => $p, 'qty' => $bags_small]; }
+        } else {
+            $product = wc_get_product($pid1);
+            if ($product) $items[] = ['product' => $product, 'qty' => max(1, $qty)];
+        }
     }
 
     if (!$items) {
