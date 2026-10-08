@@ -2,7 +2,7 @@
 /**
  * Plugin Name: שושקה — ניהול חנות
  * Description: ליקוט ומשלוח הזמנות — שושקה
- * Version: 5.6.6
+ * Version: 5.7.17
  */
 defined('ABSPATH') || exit;
 
@@ -11,6 +11,33 @@ add_action('init', function() {
     add_shortcode('shushka_picking',  function() { return shpk_frontend_page('pick'); });
     add_shortcode('shushka_delivery', function() { return shpk_frontend_page('deliver'); });
 });
+
+/* ── הגבלת משלוח ליישובי הערבה התיכונה ──────────────────────
+ * שכבת הגנה נוספת לצד הגבלת אזור המשלוח ב-WooCommerce (מיקוד 868*):
+ * אם הלקוח בחר שיטת משלוח (לא איסוף עצמי) אבל לא המיקוד ולא שם
+ * היישוב שהוקלד תואמים לאחד מ-9 יישובי הערבה — חוסמים את ההזמנה.
+ */
+add_action('woocommerce_after_checkout_validation', function ($data, $errors) {
+    $chosen = WC()->session ? (array) WC()->session->get('chosen_shipping_methods') : [];
+    $method = $chosen[0] ?? '';
+    if (strpos($method, 'local_pickup') === 0) return; // איסוף עצמי מהחנות — לא נוגע
+
+    $settlements = ['עידן', 'עיר אובות', 'עין חצבה', 'חצבה', 'עין יהב', 'ספיר', 'צופר', 'צוקים', 'פארן'];
+
+    $postcode = !empty($data['shipping_postcode']) ? $data['shipping_postcode'] : ($data['billing_postcode'] ?? '');
+    $postcode = preg_replace('/\D+/', '', (string) $postcode);
+    $postcode_ok = $postcode !== '' && strpos($postcode, '868') === 0;
+
+    $city = !empty($data['shipping_city']) ? $data['shipping_city'] : ($data['billing_city'] ?? '');
+    $city_ok = false;
+    foreach ($settlements as $s) {
+        if (mb_strpos((string) $city, $s) !== false) { $city_ok = true; break; }
+    }
+
+    if (!$postcode_ok && !$city_ok) {
+        $errors->add('shipping', 'אנחנו מספקים משלוחים רק ליישובי הערבה התיכונה (עידן, עיר אובות, עין חצבה, חצבה, עין יהב, ספיר, צופר, צוקים, פארן). לאיסוף עצמי מהחנות, בחרו באפשרות "איסוף מקומי" בשלב המשלוח.');
+    }
+}, 10, 2);
 
 /* ── PIN helper ──────────────────────────────────────── */
 function shpk_check_pin() {
@@ -243,33 +270,73 @@ add_action('admin_init', function() {
         exit;
     }
 
-    // ייצוא הזמנות נארזות
+    // ייצוא הזמנות נארזות — קובץ נפרד לכל לקוח, בתוך ZIP אחד.
+    // פורמט כל קובץ CSV תואם ל"ייבוא פריטים למסמך → קובץ פשוט" של הקופה:
+    // מספר מסמך (מספר הזמנה בווקומרס), ברקוד/קוד פריט, כמות, מחיר ליחידה.
     if ($action === 'export_packed') {
         $pin    = get_option('shushka_pick_pin', '1234');
         $pin_ok = isset($_COOKIE['shushka_pin']) && $_COOKIE['shushka_pin'] === md5($pin . AUTH_KEY);
         if (!$pin_ok && !current_user_can('manage_woocommerce')) wp_die('אין הרשאה');
+
         $orders = wc_get_orders(['status' => ['packed'], 'limit' => -1, 'orderby' => 'date', 'order' => 'ASC']);
-        header('Content-Type: text/csv; charset=utf-8');
-        header('Content-Disposition: attachment; filename="shushka-packed-' . date('Ymd-His') . '.csv"');
-        header('Pragma: no-cache');
-        $out = fopen('php://output', 'w');
-        fputs($out, "\xEF\xBB\xBF");
-        fputcsv($out, ['מספר הזמנה', 'שם לקוח', 'ברקוד', 'שם מוצר', 'כמות', 'מחיר ליחידה', 'סה"כ שורה']);
-        $seq = 0;
+        if (!$orders) wp_die('אין הזמנות בסטטוס "נארז" לייצוא.');
+
+        // קיבוץ לפי לקוח — טלפון כמזהה יציב (כמו בקופה), שם כגיבוי כשאין טלפון.
+        $groups = [];
         foreach ($orders as $order) {
-            $seq++;
+            $phone = preg_replace('/\D+/', '', (string) $order->get_billing_phone());
             $cname = trim($order->get_billing_first_name() . ' ' . $order->get_billing_last_name());
-            foreach ($order->get_items() as $item) {
-                $product    = $item->get_product();
-                $sku        = $product ? $product->get_sku() : '';
-                $qty        = $item->get_quantity();
-                $unit_price = $qty > 0 ? round($item->get_total() / $qty, 2) : 0;
-                fputcsv($out, [$seq, $cname, $sku, $item->get_name(), $qty,
-                               number_format((float)$unit_price, 2, '.', ''),
-                               number_format((float)$item->get_total(), 2, '.', '')]);
-            }
+            $key   = $phone !== '' ? 'phone_' . $phone : 'name_' . $cname;
+            if (!isset($groups[$key])) $groups[$key] = ['name' => $cname ?: 'לקוח', 'orders' => []];
+            $groups[$key]['orders'][] = $order;
         }
-        fclose($out);
+
+        $tmp_zip = wp_tempnam('shushka-packed.zip');
+        $zip = new ZipArchive();
+        if ($zip->open($tmp_zip, ZipArchive::OVERWRITE) !== true) wp_die('שגיאה ביצירת קובץ ZIP');
+
+        $used_names = [];
+        foreach ($groups as $group) {
+            $order_ids = array_map(fn($o) => $o->get_id(), $group['orders']);
+
+            $csv = fopen('php://temp', 'w+');
+            fputs($csv, "\xEF\xBB\xBF");
+            foreach ($group['orders'] as $order) {
+                $doc_num = $order->get_id();
+                foreach ($order->get_items() as $item) {
+                    $product    = $item->get_product();
+                    $sku        = $product ? $product->get_sku() : '';
+                    $qty        = $item->get_quantity();
+                    $unit_price = $qty > 0 ? round($item->get_total() / $qty, 2) : 0;
+                    fputcsv($csv, [$doc_num, $sku, $qty, number_format((float) $unit_price, 2, '.', '')]);
+                }
+            }
+            rewind($csv);
+            $content = stream_get_contents($csv);
+            fclose($csv);
+
+            $safe_name = preg_replace('/[\\\\\/:*?"<>|]+/u', '', $group['name']);
+            $safe_name = trim(preg_replace('/\s+/u', '_', $safe_name));
+            if ($safe_name === '') $safe_name = 'לקוח';
+
+            $filename = $safe_name . '_' . implode('-', $order_ids) . '.csv';
+            $i = 2;
+            while (isset($used_names[$filename])) {
+                $filename = $safe_name . '_' . implode('-', $order_ids) . '_' . $i . '.csv';
+                $i++;
+            }
+            $used_names[$filename] = true;
+
+            $zip->addFromString($filename, $content);
+        }
+        $zip->close();
+
+        header('Content-Type: application/zip');
+        header('Content-Disposition: attachment; filename="shushka-packed-' . date('Ymd-His') . '.zip"');
+        header('Pragma: no-cache');
+        header('Content-Length: ' . filesize($tmp_zip));
+        readfile($tmp_zip);
+        @unlink($tmp_zip);
         exit;
     }
 });
@@ -721,8 +788,9 @@ function shpk_prices_page() {
         // Section 1: export
         echo '<div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:20px;margin-bottom:24px">';
         echo '<h2 style="margin-top:0">📥 ייצוא הזמנות נארזות לקופה</h2>';
-        echo '<p style="color:#555">' . $packed_count . ' הזמנות בסטטוס "נארז" מוכנות לייצוא.</p>';
-        echo '<a href="' . $base . '&action=export_packed" class="button button-primary button-large">⬇ הורד CSV</a>';
+        echo '<p style="color:#555">' . $packed_count . ' הזמנות בסטטוס "נארז" מוכנות לייצוא. '
+            . 'הקובץ יורד כ-ZIP עם קובץ CSV נפרד לכל לקוח (שם הקובץ כולל את שם הלקוח ומספרי ההזמנות).</p>';
+        echo '<a href="' . $base . '&action=export_packed" class="button button-primary button-large">⬇ הורד ZIP</a>';
         echo '</div>';
 
         // Section 2: import
@@ -4869,3 +4937,767 @@ add_action('wp_ajax_shpk_gforms_import_one', function () {
         wp_send_json_success(['done' => 0, 'skip' => 0, 'fail' => 1, 'log' => $cust_name . ': ' . $e->getMessage(), 'next_offset' => $next, 'total' => $total, 'finished' => $finished]);
     }
 });
+
+/* ═══════════════════════════════════════════════════════════
+   צילום ועדכון מוצרים לעובדים   (v5.7.0)
+   ═══════════════════════════════════════════════════════════ */
+
+add_action('init', function () {
+    add_shortcode('shushka_photo', function () {
+        ob_start();
+        shpk_photo_page(true);
+        return ob_get_clean();
+    });
+});
+
+add_action('admin_menu', function () {
+    add_submenu_page('shushka-pick', 'צילום מוצרים', '📷 צילום מוצרים',
+        'manage_woocommerce', 'shushka-photo', 'shpk_photo_page');
+});
+
+/* ── auth: PIN cookie (עובדים) או הרשאת אדמין ────────────── */
+function shpk_photo_auth_ok() {
+    $pin    = get_option('shushka_pick_pin', '1234');
+    $pin_ok = isset($_COOKIE['shushka_pin']) && $_COOKIE['shushka_pin'] === md5($pin . AUTH_KEY);
+    return $pin_ok || current_user_can('manage_woocommerce');
+}
+
+/* ── האם התמונה הראשית היא עדיין ה-placeholder הגנרי? ───── */
+function shpk_photo_is_generic_image($product_id) {
+    $thumb_id = get_post_thumbnail_id($product_id);
+    if (!$thumb_id) return true;
+    $url = wp_get_attachment_url($thumb_id);
+    if (!$url) return true;
+    $fname = basename(wp_parse_url($url, PHP_URL_PATH));
+    return (bool) preg_match('/^product-\d+\.(png|jpe?g|webp)$/i', $fname);
+}
+
+function shpk_photo_status($product_id) {
+    if (get_post_meta($product_id, 'shpk_photo_pending', true)) return 'pending';
+    return shpk_photo_is_generic_image($product_id) ? 'not_photographed' : 'done';
+}
+
+/* ── נתיב REST קליל לסריקת סטטוס-צילום של כל הקטלוג בבקשה אחת ──────────
+   ה-REST הרגיל של WooCommerce (wc/v3/products) בונה אובייקט WC_Product מלא
+   לכל מוצר (תמחור, מאפיינים, מסים וכו') גם כש-_fields מבקש רק שדה אחד —
+   ה-_fields רק חותך את הפלט, לא את העבודה הפנימית. על האתר הזה זה גורם
+   לכ-4 שניות לבקשה *לכל עמוד* (גם בקשה לפריט בודד), כך שסריקת 2,600+
+   מוצרים בדפדוף לוקחת דקות. נתיב גולמי עם שאילתת SQL ישירה (כמו שאר
+   ה-AJAX handlers בתוסף) מחזיר את כולם בבת אחת תוך פחות משנייה. ── */
+add_action('rest_api_init', function () {
+    register_rest_route('shushka/v1', '/photo-scan', [
+        'methods'             => 'GET',
+        'permission_callback' => function () { return current_user_can('manage_woocommerce'); },
+        'callback'            => function () {
+            global $wpdb;
+            $rows = $wpdb->get_results("
+                SELECT p.ID,
+                       (SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id=p.ID AND meta_key='shpk_photo_pending' LIMIT 1) AS pending
+                FROM {$wpdb->posts} p
+                WHERE p.post_type='product' AND p.post_status='publish'
+            ");
+            $results = [];
+            foreach ($rows as $r) {
+                $pid = (int) $r->ID;
+                $status = $r->pending ? 'pending' : (shpk_photo_is_generic_image($pid) ? 'not_photographed' : 'done');
+                $results[] = ['id' => $pid, 'status' => $status];
+            }
+            return $results;
+        },
+    ]);
+
+    /* ── היסטוריית צילום עובדים: אילו מוצרים עברו דרך דף הצילום, מתי,
+       ואילו תמונות "יתומות" (תקועות מבאג הדריסה הישן) מצורפות אליהם ── */
+    register_rest_route('shushka/v1', '/photo-history', [
+        'methods'             => 'GET',
+        'permission_callback' => function () { return current_user_can('manage_woocommerce'); },
+        'callback'            => function () {
+            global $wpdb;
+            $rows = $wpdb->get_results("
+                SELECT post_id AS product_id, meta_value AS raw_id
+                FROM {$wpdb->postmeta}
+                WHERE meta_key = 'shpk_photo_raw_id'
+            ");
+            $results = [];
+            foreach ($rows as $r) {
+                $pid    = (int) $r->product_id;
+                $raw_id = (int) $r->raw_id;
+                $product = wc_get_product($pid);
+                if (!$product) continue;
+
+                $raw_att  = get_post($raw_id);
+                $raw_date = $raw_att ? $raw_att->post_date : null;
+
+                $featured_id = (int) $product->get_image_id();
+                $gallery_ids = array_map('intval', $product->get_gallery_image_ids());
+                $keep = array_merge([$featured_id, $raw_id], $gallery_ids);
+
+                $children = $wpdb->get_results($wpdb->prepare("
+                    SELECT ID, post_date, post_title FROM {$wpdb->posts}
+                    WHERE post_type='attachment' AND post_parent=%d
+                ", $pid));
+                $orphans = [];
+                foreach ($children as $c) {
+                    if (!in_array((int) $c->ID, $keep, true)) {
+                        $orphans[] = ['id' => (int) $c->ID, 'date' => $c->post_date, 'title' => $c->post_title];
+                    }
+                }
+
+                $results[] = [
+                    'id'          => $pid,
+                    'name'        => $product->get_name(),
+                    'raw_id'      => $raw_id,
+                    'raw_date'    => $raw_date,
+                    'featured_id' => $featured_id,
+                    'gallery_ids' => $gallery_ids,
+                    'orphans'     => $orphans,
+                ];
+            }
+            return $results;
+        },
+    ]);
+
+    /* ── תמונות גלריה (רכיבים/תזונה) שממתינות לעיבוד רקע קרם ── */
+    register_rest_route('shushka/v1', '/gallery-pending', [
+        'methods'             => 'GET',
+        'permission_callback' => function () { return current_user_can('manage_woocommerce'); },
+        'callback'            => function () {
+            global $wpdb;
+            $rows = $wpdb->get_results("
+                SELECT post_id, meta_value FROM {$wpdb->postmeta}
+                WHERE meta_key = 'shpk_gallery_pending' AND meta_value != ''
+            ");
+            $results = [];
+            foreach ($rows as $r) {
+                $ids = maybe_unserialize($r->meta_value);
+                if (!is_array($ids) || !$ids) continue;
+                $results[] = ['product_id' => (int) $r->post_id, 'attachment_ids' => array_map('intval', $ids)];
+            }
+            return $results;
+        },
+    ]);
+});
+
+/* ── AJAX: חיפוש מוצר + סטטוס תמונה ──────────────────────── */
+add_action('wp_ajax_shpk_photo_search',        'shpk_photo_search_handler');
+add_action('wp_ajax_nopriv_shpk_photo_search', 'shpk_photo_search_handler');
+function shpk_photo_search_handler() {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!shpk_photo_auth_ok()) { wp_send_json_error('unauthorized'); return; }
+
+    $q            = sanitize_text_field($_GET['q'] ?? '');
+    $only_missing = !empty($_GET['only_missing']);
+
+    global $wpdb;
+    $where  = "p.post_type='product' AND p.post_status='publish'";
+    $params = [];
+
+    if (mb_strlen($q) >= 2) {
+        $like    = '%' . $wpdb->esc_like($q) . '%';
+        $where  .= " AND (p.post_title LIKE %s OR EXISTS (
+                        SELECT 1 FROM {$wpdb->postmeta} sm
+                        WHERE sm.post_id=p.ID AND sm.meta_key='_sku' AND sm.meta_value LIKE %s
+                    ))";
+        $params[] = $like;
+        $params[] = $like;
+    }
+
+    if ($only_missing) {
+        $where .= " AND NOT EXISTS (
+                        SELECT 1 FROM {$wpdb->postmeta} pm
+                        WHERE pm.post_id=p.ID AND pm.meta_key='shpk_photo_pending' AND pm.meta_value!=''
+                    )
+                    AND (
+                        NOT EXISTS (SELECT 1 FROM {$wpdb->postmeta} tm WHERE tm.post_id=p.ID AND tm.meta_key='_thumbnail_id')
+                        OR EXISTS (
+                            SELECT 1 FROM {$wpdb->postmeta} tm2
+                            JOIN {$wpdb->posts} att ON att.ID = tm2.meta_value
+                            WHERE tm2.post_id=p.ID AND tm2.meta_key='_thumbnail_id'
+                            AND att.guid REGEXP 'product-[0-9]+[.](png|jpe?g|webp)$'
+                        )
+                    )";
+    }
+
+    $sql = "SELECT p.ID, p.post_title,
+                   (SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id=p.ID AND meta_key='_sku' LIMIT 1) AS sku,
+                   (SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id=p.ID AND meta_key='shpk_photo_pending' LIMIT 1) AS pending,
+                   (SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id=p.ID AND meta_key='_thumbnail_id' LIMIT 1) AS thumb_id
+            FROM {$wpdb->posts} p
+            WHERE $where
+            ORDER BY p.post_title LIMIT 40";
+    $rows = $params ? $wpdb->get_results($wpdb->prepare($sql, $params)) : $wpdb->get_results($sql);
+
+    $results = [];
+    foreach ($rows as $r) {
+        $pid    = (int)$r->ID;
+        $status = $r->pending ? 'pending' : (shpk_photo_is_generic_image($pid) ? 'not_photographed' : 'done');
+        $thumb  = $r->thumb_id ? wp_get_attachment_image_url((int)$r->thumb_id, 'thumbnail') : '';
+        $results[] = ['id' => $pid, 'name' => $r->post_title, 'sku' => (string)$r->sku,
+                      'status' => $status, 'thumb' => $thumb ?: ''];
+    }
+    if (ob_get_length()) ob_clean();
+    wp_send_json_success($results);
+}
+
+/* ── AJAX: פרטי מוצר מלאים (לכרטיס העריכה) ───────────────── */
+add_action('wp_ajax_shpk_photo_get_product',        'shpk_photo_get_product_handler');
+add_action('wp_ajax_nopriv_shpk_photo_get_product', 'shpk_photo_get_product_handler');
+function shpk_photo_get_product_handler() {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!shpk_photo_auth_ok()) { wp_send_json_error('unauthorized'); return; }
+
+    $product_id = absint($_GET['id'] ?? 0);
+    $product    = $product_id ? wc_get_product($product_id) : null;
+    if (!$product) { wp_send_json_error('מוצר לא נמצא'); return; }
+
+    $parent_cat_id = 0;
+    $sub_cat_id    = 0;
+    $terms = get_the_terms($product_id, 'product_cat');
+    if (is_array($terms)) {
+        foreach ($terms as $t) {
+            if ((int) $t->parent === 0) {
+                if (!$sub_cat_id) $parent_cat_id = (int) $t->term_id;
+            } else {
+                $sub_cat_id    = (int) $t->term_id;
+                $parent_cat_id = (int) $t->parent;
+            }
+        }
+    }
+
+    $brand_ids = taxonomy_exists('product_brand')
+        ? wp_get_post_terms($product_id, 'product_brand', ['fields' => 'ids'])
+        : [];
+
+    wp_send_json_success([
+        'id'             => $product_id,
+        'name'           => $product->get_name(),
+        'sku'            => $product->get_sku(),
+        'price'          => $product->get_regular_price(),
+        'category_id'    => $parent_cat_id,
+        'subcategory_id' => $sub_cat_id,
+        'brand_id'       => $brand_ids ? (int) $brand_ids[0] : 0,
+        'thumb'          => wp_get_attachment_image_url($product->get_image_id(), 'thumbnail') ?: '',
+        'status'         => shpk_photo_status($product_id),
+        'permalink'      => get_permalink($product_id) ?: '',
+    ]);
+}
+
+/* ── AJAX: העלאת תמונה ראשית (גולמית, ממתינה לעיבוד) ─────── */
+add_action('wp_ajax_shpk_photo_upload',        'shpk_photo_upload_handler');
+add_action('wp_ajax_nopriv_shpk_photo_upload', 'shpk_photo_upload_handler');
+function shpk_photo_upload_handler() {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!shpk_photo_auth_ok()) { wp_send_json_error('unauthorized'); return; }
+
+    $product_id = absint($_POST['product_id'] ?? 0);
+    if (!$product_id || !get_post($product_id)) { wp_send_json_error('מוצר לא נמצא'); return; }
+    if (empty($_FILES['photo'])) { wp_send_json_error('לא התקבלה תמונה'); return; }
+
+    require_once ABSPATH . 'wp-admin/includes/image.php';
+    require_once ABSPATH . 'wp-admin/includes/file.php';
+    require_once ABSPATH . 'wp-admin/includes/media.php';
+
+    $attach_id = media_handle_upload('photo', $product_id);
+    if (is_wp_error($attach_id)) { wp_send_json_error($attach_id->get_error_message()); return; }
+
+    set_post_thumbnail($product_id, $attach_id);
+    update_post_meta($product_id, 'shpk_photo_pending', '1');
+    update_post_meta($product_id, 'shpk_photo_raw_id', $attach_id);
+
+    if (ob_get_length()) ob_clean();
+    wp_send_json_success([
+        'thumb'  => wp_get_attachment_image_url($attach_id, 'thumbnail'),
+        'status' => 'pending',
+    ]);
+}
+
+/* ── AJAX: העלאת תמונת רכיבים/תזונה (לגלריה, בלי עיבוד) ──── */
+add_action('wp_ajax_shpk_photo_upload_gallery',        'shpk_photo_upload_gallery_handler');
+add_action('wp_ajax_nopriv_shpk_photo_upload_gallery', 'shpk_photo_upload_gallery_handler');
+function shpk_photo_upload_gallery_handler() {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!shpk_photo_auth_ok()) { wp_send_json_error('unauthorized'); return; }
+
+    $product_id = absint($_POST['product_id'] ?? 0);
+    $product    = $product_id ? wc_get_product($product_id) : null;
+    if (!$product) { wp_send_json_error('מוצר לא נמצא'); return; }
+    if (empty($_FILES['photo'])) { wp_send_json_error('לא התקבלה תמונה'); return; }
+
+    require_once ABSPATH . 'wp-admin/includes/image.php';
+    require_once ABSPATH . 'wp-admin/includes/file.php';
+    require_once ABSPATH . 'wp-admin/includes/media.php';
+
+    $attach_id = media_handle_upload('photo', $product_id);
+    if (is_wp_error($attach_id)) { wp_send_json_error($attach_id->get_error_message()); return; }
+
+    $gallery   = $product->get_gallery_image_ids();
+    $gallery[] = $attach_id;
+    $product->set_gallery_image_ids($gallery);
+    $product->save();
+
+    // מסמן לעיבוד רקע קרם (לא מצויר — תמונות רכיבים/תזונה נשארות אינפורמטיביות
+    // וקריאות) ע"י process_product_photos.py. רשימה (לא דגל בודד) כי יכולות
+    // להיות כמה תמונות גלריה ממתינות בו-זמנית (רכיבים + תזונה).
+    $pending   = get_post_meta($product_id, 'shpk_gallery_pending', true);
+    $pending   = is_array($pending) ? $pending : [];
+    $pending[] = $attach_id;
+    update_post_meta($product_id, 'shpk_gallery_pending', $pending);
+
+    if (ob_get_length()) ob_clean();
+    wp_send_json_success(['thumb' => wp_get_attachment_image_url($attach_id, 'thumbnail')]);
+}
+
+/* ── AJAX: עדכון קטגוריה / מותג / מחיר / ברקוד ───────────── */
+add_action('wp_ajax_shpk_photo_update_details',        'shpk_photo_update_details_handler');
+add_action('wp_ajax_nopriv_shpk_photo_update_details', 'shpk_photo_update_details_handler');
+function shpk_photo_update_details_handler() {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!shpk_photo_auth_ok()) { wp_send_json_error('unauthorized'); return; }
+
+    $product_id = absint($_POST['product_id'] ?? 0);
+    $product    = $product_id ? wc_get_product($product_id) : null;
+    if (!$product) { wp_send_json_error('מוצר לא נמצא'); return; }
+
+    $name           = sanitize_text_field($_POST['name'] ?? '');
+    $sku            = sanitize_text_field($_POST['sku'] ?? '');
+    $price          = sanitize_text_field($_POST['price'] ?? '');
+    $parent_cat_id  = absint($_POST['category_id'] ?? 0);
+    $sub_cat_id     = absint($_POST['subcategory_id'] ?? 0);
+    $final_cat_id   = $sub_cat_id ?: $parent_cat_id;
+    $brand_id       = absint($_POST['brand_id'] ?? 0);
+    $new_brand_name = sanitize_text_field($_POST['new_brand_name'] ?? '');
+
+    try {
+        if ($name !== '') $product->set_name($name);
+        if ($sku !== '') $product->set_sku($sku);
+        if ($price !== '' && is_numeric($price)) $product->set_regular_price($price);
+        $product->save();
+    } catch (Exception $e) {
+        wp_send_json_error($e->getMessage()); return;
+    }
+
+    if ($final_cat_id) wp_set_object_terms($product_id, [$final_cat_id], 'product_cat');
+
+    if ($new_brand_name !== '' && taxonomy_exists('product_brand')) {
+        $existing = get_term_by('name', $new_brand_name, 'product_brand');
+        if ($existing) {
+            $brand_id = (int) $existing->term_id;
+        } else {
+            $created = wp_insert_term($new_brand_name, 'product_brand');
+            if (is_wp_error($created)) { wp_send_json_error('שגיאה ביצירת מותג: ' . $created->get_error_message()); return; }
+            $brand_id = (int) $created['term_id'];
+        }
+    }
+    if ($brand_id && taxonomy_exists('product_brand')) wp_set_object_terms($product_id, [$brand_id], 'product_brand');
+
+    if (ob_get_length()) ob_clean();
+    wp_send_json_success();
+}
+
+/* ── עמוד הצילום/עריכה ────────────────────────────────────── */
+function shpk_photo_page($frontend = false) {
+    if (!shpk_check_pin()) { shpk_pin_form('כניסה לדף צילום מוצרים'); return; }
+
+    $ajax_url = admin_url('admin-ajax.php');
+    $nonce    = wp_create_nonce('shushka_nonce');
+
+    $cats = get_terms(['taxonomy' => 'product_cat', 'hide_empty' => false, 'orderby' => 'name']);
+    $cats = is_array($cats) ? $cats : [];
+
+    $brand_tax_exists = taxonomy_exists('product_brand');
+    $brands = $brand_tax_exists
+        ? get_terms(['taxonomy' => 'product_brand', 'hide_empty' => false, 'orderby' => 'name'])
+        : [];
+    $brands = is_array($brands) ? $brands : [];
+    ?>
+    <style>
+    #spw{font-family:Rubik,Arial,sans-serif;direction:rtl;max-width:480px;margin:0 auto;padding:14px;color:#2b2b2b}
+    #spw h1{font-size:20px;color:#183625;margin-bottom:12px}
+    #spw input[type=text],#spw input[type=number],#spw select{
+        width:100%;box-sizing:border-box;font-size:16px;padding:10px;border:1px solid #ccc;border-radius:8px;margin-bottom:8px}
+    #spw-search-row{display:flex;gap:8px;align-items:center;margin-bottom:6px}
+    #spw-search-row input{flex:1;margin-bottom:0}
+    #spw-scan-btn{flex-shrink:0;height:44px;padding:0 14px;border:none;border-radius:8px;background:#183625;color:#fff;font-size:14px;font-weight:600;white-space:nowrap;cursor:pointer}
+    #spw-only-missing{display:flex;align-items:center;gap:6px;font-size:13px;color:#555;margin-bottom:10px}
+    #spw-scanner-overlay{display:none;position:fixed;inset:0;background:#000;z-index:1000;flex-direction:column;align-items:center;justify-content:center}
+    #spw-scanner-overlay.show{display:flex}
+    #spw-scanner-box{width:90vw;max-width:360px;aspect-ratio:1/1;border-radius:12px;overflow:hidden;background:#111}
+    #spw-scanner-video{width:100%;height:100%;object-fit:cover}
+    #spw-scanner-hint{color:#fff;font-size:13px;margin:14px 0;text-align:center;padding:0 20px}
+    #spw-scanner-close{padding:10px 24px;border-radius:20px;border:none;background:#fff;color:#183625;font-weight:600;cursor:pointer}
+    .spw-card{display:flex;align-items:center;gap:10px;background:#fff;border:1px solid #eee;border-radius:10px;
+        padding:8px 10px;margin-bottom:8px;cursor:pointer}
+    .spw-card:hover{border-color:#183625}
+    .spw-card img{width:46px;height:46px;object-fit:cover;border-radius:6px;background:#f2f2f2;flex-shrink:0}
+    .spw-card-info{flex:1;min-width:0}
+    .spw-card-name{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .spw-card-sku{font-size:11px;color:#999}
+    .spw-badge{font-size:11px;font-weight:700;border-radius:10px;padding:2px 8px;white-space:nowrap}
+    .spw-badge-not_photographed{background:#f5f5f5;color:#888}
+    .spw-badge-pending{background:#fff3e0;color:#e65100}
+    .spw-badge-done{background:#e8f5e9;color:#2e7d32}
+    #spw-edit{display:none;background:#fff;border:1px solid #ddd;border-radius:12px;padding:16px;margin-top:10px}
+    #spw-edit h2{font-size:16px;margin-bottom:10px}
+    #spw-edit-thumb{width:100%;max-width:220px;display:block;margin:0 auto 12px;border-radius:8px;background:#f2f2f2}
+    .spw-btn{display:block;width:100%;padding:12px;border:none;border-radius:10px;font-size:15px;font-weight:600;
+        cursor:pointer;margin-bottom:8px;text-align:center}
+    .spw-btn-main{background:#183625;color:#fff}
+    .spw-btn-main:disabled{opacity:.65;cursor:default}
+    .spw-btn-main.spw-saved{background:#2e7d32}
+    .spw-btn-sec{background:#eee;color:#333}
+    .spw-msg{text-align:center;color:#999;font-size:13px;padding:16px}
+    .spw-btn-skip{background:none;color:#999;text-decoration:underline;padding:4px}
+    .spw-row2{display:flex;gap:8px}
+    .spw-row2 .spw-btn{flex:1}
+    #spw-back{background:none;border:none;color:#888;font-size:13px;cursor:pointer;margin-top:10px;text-decoration:underline}
+    #spw-toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#183625;color:#fff;
+        padding:10px 20px;border-radius:20px;font-size:13px;opacity:0;transition:.25s;pointer-events:none;z-index:999}
+    #spw-toast.show{opacity:1}
+
+    /* הסתרת כפתור "סל קניות" הצף (woo-fly-cart) — לא רלוונטי בדף הזה */
+    #woofc-count{display:none !important}
+    </style>
+
+    <div id="spw">
+        <h1>📷 צילום מוצרים</h1>
+
+        <div id="spw-search-row">
+            <button id="spw-scan-btn" onclick="spwStartScanner()" title="סרוק ברקוד">📷 סרוק</button>
+            <input type="text" id="spw-q" placeholder="חיפוש לפי שם או ברקוד..." autocomplete="off">
+        </div>
+        <label id="spw-only-missing"><input type="checkbox" id="spw-only-missing-cb"> הצג רק מוצרים שלא צולמו</label>
+
+        <div id="spw-results"></div>
+
+        <div id="spw-scanner-overlay">
+            <div id="spw-scanner-box"><video id="spw-scanner-video" muted playsinline></video></div>
+            <div id="spw-scanner-hint">כוון את המצלמה לברקוד, ממוקד ולא מטושטש</div>
+            <button id="spw-scanner-close" onclick="spwStopScanner()">✕ סגור</button>
+        </div>
+
+        <div id="spw-edit">
+            <button id="spw-back" onclick="spwBack()">← חזרה לחיפוש</button>
+            <label style="font-size:12px;color:#777">שם מוצר</label>
+            <input type="text" id="spw-name" style="font-weight:600">
+            <img id="spw-edit-thumb" src="">
+            <a id="spw-view-link" href="#" target="_blank" style="display:none;text-align:center;font-size:13px;color:#183625;margin-bottom:10px">🔗 צפה במוצר באתר ↗</a>
+
+            <input type="file" id="spw-file-main" accept="image/*" capture="environment" style="display:none">
+            <button class="spw-btn spw-btn-main" onclick="document.getElementById('spw-file-main').click()">📷 צלם תמונה ראשית</button>
+
+            <div class="spw-row2">
+                <input type="file" id="spw-file-ingredients" accept="image/*" capture="environment" style="display:none">
+                <button class="spw-btn spw-btn-sec" onclick="document.getElementById('spw-file-ingredients').click()">🧾 צלם רכיבים</button>
+                <input type="file" id="spw-file-nutrition" accept="image/*" capture="environment" style="display:none">
+                <button class="spw-btn spw-btn-sec" onclick="document.getElementById('spw-file-nutrition').click()">📊 צלם ערכים תזונתיים</button>
+            </div>
+
+            <hr style="border:none;border-top:1px solid #eee;margin:14px 0">
+
+            <label style="font-size:12px;color:#777">קטגוריה</label>
+            <select id="spw-cat-parent"></select>
+
+            <label style="font-size:12px;color:#777">תת-קטגוריה</label>
+            <select id="spw-cat-sub"></select>
+
+            <?php if ($brand_tax_exists): ?>
+            <label style="font-size:12px;color:#777">מותג</label>
+            <select id="spw-brand" onchange="spwOnBrandChange()">
+                <option value="0">— ללא שינוי —</option>
+                <?php foreach ($brands as $b): ?>
+                    <option value="<?php echo (int)$b->term_id; ?>"><?php echo esc_html($b->name); ?></option>
+                <?php endforeach; ?>
+                <option value="__new__">+ מותג חדש...</option>
+            </select>
+            <input type="text" id="spw-brand-new" placeholder="שם המותג החדש" style="display:none">
+            <?php endif; ?>
+
+            <label style="font-size:12px;color:#777">מחיר רגיל (₪)</label>
+            <input type="number" id="spw-price" step="0.1" min="0">
+
+            <label style="font-size:12px;color:#777">ברקוד / SKU</label>
+            <input type="text" id="spw-sku">
+
+            <button class="spw-btn spw-btn-main" id="spw-save-btn" onclick="spwSaveDetails()">💾 שמור פרטים</button>
+            <div class="spw-row2">
+                <button class="spw-btn spw-btn-sec" onclick="spwBack()">➡ למוצר הבא</button>
+                <button class="spw-btn spw-btn-sec" onclick="spwStartScanner()">📷 סרוק הבא</button>
+            </div>
+        </div>
+    </div>
+    <div id="spw-toast"></div>
+
+    <script src="https://unpkg.com/@zxing/library@0.21.3"></script>
+    <script>
+    (function(){
+    var AJAX = <?php echo json_encode($ajax_url); ?>;
+    var NONCE = <?php echo json_encode($nonce); ?>;
+    var curId = null;
+    var searchT = null;
+    var dirty = false; // true כשיש שינויים בכרטיס העריכה שעדיין לא נשמרו
+
+    var cats = <?php echo json_encode(array_map(function($c){
+        return ['id' => (int) $c->term_id, 'name' => $c->name, 'parent' => (int) $c->parent, 'slug' => $c->slug];
+    }, $cats)); ?>;
+    var catParents = cats.filter(function(c){ return c.parent === 0 && c.slug !== 'uncategorized'; });
+    var catChildren = {};
+    cats.filter(function(c){ return c.parent !== 0; }).forEach(function(c){
+        (catChildren[c.parent] = catChildren[c.parent] || []).push(c);
+    });
+
+    function buildCatSelects(parentId, subId) {
+        var parentSel = document.getElementById('spw-cat-parent');
+        parentSel.innerHTML = '<option value="0">— קטגוריה —</option>';
+        catParents.forEach(function(c){
+            parentSel.innerHTML += '<option value="' + c.id + '"' + (c.id === parentId ? ' selected' : '') + '>' + esc(c.name) + '</option>';
+        });
+        rebuildSubSelect(parentId, subId);
+    }
+    function rebuildSubSelect(parentId, subId) {
+        var subSel = document.getElementById('spw-cat-sub');
+        subSel.innerHTML = '<option value="0">— תת-קטגוריה —</option>';
+        (catChildren[parentId] || []).forEach(function(c){
+            subSel.innerHTML += '<option value="' + c.id + '"' + (c.id === subId ? ' selected' : '') + '>' + esc(c.name) + '</option>';
+        });
+    }
+    document.getElementById('spw-cat-parent').addEventListener('change', function(){
+        rebuildSubSelect(+this.value || 0, 0);
+    });
+
+    function toast(msg) {
+        var t = document.getElementById('spw-toast');
+        t.textContent = msg; t.classList.add('show');
+        setTimeout(function(){ t.classList.remove('show'); }, 2500);
+    }
+
+    var badgeLabel = {not_photographed: '⚪ לא צולם', pending: '🟡 ממתין לעיבוד', done: '🟢 צולם'};
+
+    function renderResults(items) {
+        var wrap = document.getElementById('spw-results');
+        wrap.innerHTML = '';
+        items.forEach(function(p){
+            var card = document.createElement('div');
+            card.className = 'spw-card';
+            card.onclick = function(){ spwOpenProduct(p.id); };
+            card.innerHTML =
+                '<img src="' + (p.thumb || '') + '">' +
+                '<div class="spw-card-info">' +
+                    '<div class="spw-card-name">' + esc(p.name) + '</div>' +
+                    '<div class="spw-card-sku">' + esc(p.sku || '') + '</div>' +
+                '</div>' +
+                '<span class="spw-badge spw-badge-' + p.status + '">' + badgeLabel[p.status] + '</span>';
+            wrap.appendChild(card);
+        });
+    }
+
+    function doSearch() {
+        var q = document.getElementById('spw-q').value.trim();
+        var onlyMissing = document.getElementById('spw-only-missing-cb').checked;
+        var results = document.getElementById('spw-results');
+        if (q.length < 2 && !onlyMissing) { results.innerHTML = ''; return; }
+        results.innerHTML = '<div class="spw-msg">🔍 מחפש...</div>';
+        var url = AJAX + '?action=shpk_photo_search&nonce=' + NONCE + '&q=' + encodeURIComponent(q);
+        if (onlyMissing) url += '&only_missing=1';
+        fetch(url).then(function(r){ return r.json(); }).then(function(d){
+            if (!d.success) { results.innerHTML = '<div class="spw-msg">שגיאה בחיפוש</div>'; return; }
+            if (!d.data.length) { results.innerHTML = '<div class="spw-msg">אין מוצרים מתאימים לחיפוש</div>'; return; }
+            renderResults(d.data);
+        });
+    }
+    document.getElementById('spw-q').addEventListener('input', function(){
+        clearTimeout(searchT); searchT = setTimeout(doSearch, 300);
+    });
+    document.getElementById('spw-only-missing-cb').addEventListener('change', doSearch);
+
+    // ── סריקת ברקוד (לחיפוש מהיר — לא לתמונה הרשמית) ────────
+    // בדיקת ספרת ביקורת (checksum) של EAN-13/EAN-8/UPC-A — דוחה קריאות שגויות של הסורק
+    // במקום לקבל אותן כאילו הצליחו. ספרה אחת שגויה כמעט תמיד תיכשל בבדיקה הזו.
+    function barcodeChecksumOk(text) {
+        if (!/^\d{8}$|^\d{12}$|^\d{13}$/.test(text)) return true; // לא מספר תקן — לא בודקים
+        var digits = text.split('').map(Number);
+        var check = digits.pop();
+        var sum = 0;
+        for (var i = 0; i < digits.length; i++) {
+            var fromRight = digits.length - i;
+            sum += digits[i] * (fromRight % 2 === 1 ? 3 : 1);
+        }
+        return ((10 - (sum % 10)) % 10) === check;
+    }
+
+    var codeReader = null;
+    window.spwStartScanner = function() {
+        if (!confirmLeaveEdit()) return;
+        curId = null;
+        document.getElementById('spw-edit').style.display = 'none';
+        document.getElementById('spw-results').style.display = 'none';
+        document.getElementById('spw-scanner-overlay').classList.add('show');
+        var hints = new Map();
+        hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+            ZXing.BarcodeFormat.EAN_13, ZXing.BarcodeFormat.EAN_8,
+            ZXing.BarcodeFormat.UPC_A, ZXing.BarcodeFormat.UPC_E,
+            ZXing.BarcodeFormat.CODE_128,
+        ]);
+        codeReader = new ZXing.BrowserMultiFormatReader(hints);
+        codeReader.decodeFromConstraints(
+            { video: {
+                facingMode: 'environment',
+                width:  { ideal: 1920 },
+                height: { ideal: 1080 },
+                // best-effort — מתעלמים ממנו אם הדפדפן לא תומך. מטרה: למשוך את המצלמה
+                // ללנס הראשי (1x) ולא ללנס רחב-זווית (0.5x) שבו ברקודים קטנים/על בקבוקים
+                // קשים יותר לקריאה, ולהעדיף פוקוס רציף לטווח קרוב.
+                advanced: [{ zoom: 2 }, { focusMode: 'continuous' }],
+            } },
+            'spw-scanner-video',
+            function(result, err) {
+                if (!result) return; // err נורה כל עוד לא זוהה כלום — לא שגיאה אמיתית
+                var text = result.getText();
+                if (!barcodeChecksumOk(text)) return; // קריאה שגויה — ממשיכים לסרוק בשקט
+                document.getElementById('spw-q').value = text;
+                spwStopScanner();
+                doSearch();
+            }
+        ).catch(function() {
+            toast('לא ניתן לגשת למצלמה');
+            spwStopScanner();
+        });
+    };
+    window.spwStopScanner = function() {
+        document.getElementById('spw-scanner-overlay').classList.remove('show');
+        document.getElementById('spw-results').style.display = 'block';
+        if (codeReader) {
+            codeReader.reset();
+            codeReader = null;
+        }
+    };
+
+    window.spwOpenProduct = function(id) {
+        fetch(AJAX + '?action=shpk_photo_get_product&nonce=' + NONCE + '&id=' + id)
+            .then(function(r){ return r.json(); }).then(function(d){
+                if (!d.success) { toast('שגיאה בטעינת מוצר'); return; }
+                var p = d.data;
+                curId = p.id;
+                document.getElementById('spw-name').value = p.name || '';
+                document.getElementById('spw-edit-thumb').src = p.thumb || '';
+                document.getElementById('spw-price').value = p.price || '';
+                document.getElementById('spw-sku').value = p.sku || '';
+                var link = document.getElementById('spw-view-link');
+                if (p.permalink) { link.href = p.permalink; link.style.display = 'block'; }
+                else { link.style.display = 'none'; }
+                buildCatSelects(p.category_id || 0, p.subcategory_id || 0);
+                var brandSel = document.getElementById('spw-brand');
+                if (brandSel) {
+                    brandSel.value = p.brand_id ? String(p.brand_id) : '0';
+                    document.getElementById('spw-brand-new').style.display = 'none';
+                    document.getElementById('spw-brand-new').value = '';
+                }
+                dirty = false;
+                resetSaveBtn();
+                document.getElementById('spw-results').style.display = 'none';
+                document.getElementById('spw-edit').style.display = 'block';
+            });
+    };
+
+    function confirmLeaveEdit() {
+        if (curId && dirty) {
+            return confirm('יש שינויים שלא נשמרו במוצר הנוכחי. לצאת בלי לשמור?');
+        }
+        return true;
+    }
+
+    window.spwBack = function() {
+        if (!confirmLeaveEdit()) return;
+        curId = null;
+        document.getElementById('spw-edit').style.display = 'none';
+        document.getElementById('spw-results').style.display = 'block';
+        doSearch();
+    };
+
+    function uploadFile(inputEl, action, onDone) {
+        inputEl.onchange = function() {
+            if (!inputEl.files || !inputEl.files[0] || !curId) return;
+            var fd = new FormData();
+            fd.append('action', action);
+            fd.append('nonce', NONCE);
+            fd.append('product_id', curId);
+            fd.append('photo', inputEl.files[0]);
+            toast('מעלה תמונה...');
+            fetch(AJAX, {method: 'POST', body: fd}).then(function(r){ return r.json(); }).then(function(d){
+                inputEl.value = '';
+                if (!d.success) { toast('שגיאה בהעלאה'); return; }
+                toast('הועלה בהצלחה');
+                if (onDone) onDone(d.data);
+            });
+        };
+    }
+    uploadFile(document.getElementById('spw-file-main'), 'shpk_photo_upload', function(data){
+        document.getElementById('spw-edit-thumb').src = data.thumb || '';
+    });
+    uploadFile(document.getElementById('spw-file-ingredients'), 'shpk_photo_upload_gallery', function(){});
+    uploadFile(document.getElementById('spw-file-nutrition'), 'shpk_photo_upload_gallery', function(){});
+
+    window.spwOnBrandChange = function() {
+        var brandSel = document.getElementById('spw-brand');
+        var newInput = document.getElementById('spw-brand-new');
+        newInput.style.display = (brandSel.value === '__new__') ? 'block' : 'none';
+        if (brandSel.value === '__new__') newInput.focus();
+    };
+
+    var saveBtn = document.getElementById('spw-save-btn');
+    function resetSaveBtn() {
+        saveBtn.disabled = false;
+        saveBtn.textContent = '💾 שמור פרטים';
+        saveBtn.classList.remove('spw-saved');
+    }
+    function markDirty() {
+        dirty = true;
+        resetSaveBtn();
+    }
+    ['spw-name', 'spw-sku', 'spw-price', 'spw-cat-parent', 'spw-cat-sub', 'spw-brand', 'spw-brand-new'].forEach(function(id){
+        var el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener('input', markDirty);
+        el.addEventListener('change', markDirty);
+    });
+
+    window.spwSaveDetails = function() {
+        if (!curId) return;
+        var brandSel = document.getElementById('spw-brand');
+        var isNewBrand = brandSel && brandSel.value === '__new__';
+        var fd = new URLSearchParams({
+            action: 'shpk_photo_update_details',
+            nonce: NONCE,
+            product_id: curId,
+            name: document.getElementById('spw-name').value.trim(),
+            sku: document.getElementById('spw-sku').value,
+            price: document.getElementById('spw-price').value,
+            category_id: document.getElementById('spw-cat-parent').value,
+            subcategory_id: document.getElementById('spw-cat-sub').value,
+            brand_id: (brandSel && !isNewBrand) ? brandSel.value : 0,
+            new_brand_name: isNewBrand ? document.getElementById('spw-brand-new').value.trim() : '',
+        });
+        saveBtn.disabled = true;
+        saveBtn.textContent = '⏳ שומר...';
+        fetch(AJAX, {method: 'POST', body: fd}).then(function(r){ return r.json(); }).then(function(d){
+            if (d.success) {
+                dirty = false;
+                saveBtn.textContent = '✓ נשמר';
+                saveBtn.classList.add('spw-saved');
+                saveBtn.disabled = true;
+            } else {
+                resetSaveBtn();
+                toast('שגיאה: ' + (d.data || ''));
+            }
+        }).catch(function(){
+            resetSaveBtn();
+            toast('שגיאה בשמירה — בדוק חיבור ונסה שוב');
+        });
+    };
+
+    function esc(s) {
+        return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+    })();
+    </script>
+    <?php
+}

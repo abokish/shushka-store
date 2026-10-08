@@ -9,6 +9,8 @@ from flask import Flask, jsonify, request
 import urllib.request, urllib.parse, urllib.error
 import json, base64, webbrowser, threading, time, os, traceback
 
+from process_product_photos import run as run_photo_processing, get_photo_stats
+
 app = Flask(__name__)
 
 def _load_env():
@@ -180,6 +182,20 @@ def update_shipping():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+# ─── Photo processing (employee-captured product photos) ──────────────────────
+
+@app.route("/api/process-photos", methods=["POST"])
+def process_photos():
+    log = []
+    ok, fail = run_photo_processing(log=log.append)
+    return jsonify({"success": True, "ok": ok, "fail": fail, "log": log})
+
+
+@app.route("/api/photo-stats")
+def photo_stats():
+    return jsonify(get_photo_stats())
+
+
 # ─── Auto-open browser ────────────────────────────────────────────────────────
 
 def _open():
@@ -216,6 +232,15 @@ body{font-family:'Rubik',sans-serif;background:#f7f4f0;color:#2b2b2b;font-size:1
 .btn-ship:hover{background:#245020}
 .ship-status{font-size:.82rem;min-width:160px}
 .ship-hint{font-size:.75rem;color:#a08030;margin-right:auto}
+
+.photo-section{background:#eef6ee;border-bottom:2px solid #c5e0c5;padding:.7rem 1.5rem;display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
+.photo-section label{font-weight:600;font-size:.85rem;white-space:nowrap;color:#2d5a27}
+.btn-photo{background:#2d5a27;color:#fff;border:none;border-radius:6px;padding:.4rem 1rem;cursor:pointer;font-family:inherit;font-weight:600;font-size:.83rem;white-space:nowrap}
+.btn-photo:hover{background:#245020}
+.btn-photo:disabled{opacity:.6;cursor:wait}
+.photo-status{font-size:.82rem}
+.photo-log{width:100%;margin-top:.4rem;background:#fff;border:1px solid #c5e0c5;border-radius:6px;padding:.5rem .75rem;font-size:.78rem;color:#444;max-height:160px;overflow-y:auto;white-space:pre-wrap;display:none}
+.photo-stats{font-size:.8rem;color:#5a7a55;margin-right:auto}
 
 .filters{background:#fff;padding:.7rem 1.5rem;border-bottom:1px solid #e8e3dc;display:flex;gap:.55rem;align-items:center;flex-wrap:wrap}
 .filters select,.filters input[type=text]{border:1px solid #d0cbc4;border-radius:6px;padding:.38rem .6rem;font-family:inherit;font-size:.84rem;background:#fff}
@@ -300,6 +325,15 @@ select.sel:focus{border-color:#2d5a27;outline:none}
   <span class="ship-hint">לבדיקה: פתח חלון גלישה פרטי</span>
 </div>
 
+<!-- Photo processing -->
+<div class="photo-section">
+  <label>📷 תמונות שעובדים צילמו:</label>
+  <button class="btn-photo" id="btn-process-photos" onclick="processPhotos()">עבד תמונות ממתינות</button>
+  <span class="photo-status" id="photo-status"></span>
+  <span class="photo-stats" id="photo-stats">טוען נתוני צילום...</span>
+  <div class="photo-log" id="photo-log"></div>
+</div>
+
 <!-- Filters -->
 <div class="filters">
   <select id="f-cat" onchange="onParentChange()">
@@ -352,6 +386,20 @@ async function init() {
 
   load(1);
   loadShipping();
+  loadPhotoStats();
+}
+
+// ── Photo stats ───────────────────────────────────────────────────────────────
+async function loadPhotoStats() {
+  const el = document.getElementById('photo-stats');
+  el.textContent = 'טוען נתוני צילום...';
+  try {
+    const r = await fetch('/api/photo-stats');
+    const d = await r.json();
+    el.textContent = `🟡 ${d.pending} תמונות ראשיות + ${d.gallery_pending} תמונות גלריה ממתינות  |  ✅ ${d.photographed} מתוך ${d.total} מוצרים צולמו`;
+  } catch (e) {
+    el.textContent = 'שגיאה בטעינת נתוני צילום';
+  }
 }
 
 function onParentChange() {
@@ -566,6 +614,32 @@ async function updateShipping() {
     }
   } catch(e) {
     st.textContent = '✗ ' + e.message; st.style.color = '#c62828';
+  }
+}
+
+// ── Photo processing ─────────────────────────────────────────────────────────
+async function processPhotos() {
+  const btn = document.getElementById('btn-process-photos');
+  const st  = document.getElementById('photo-status');
+  const log = document.getElementById('photo-log');
+
+  btn.disabled = true; btn.textContent = 'מעבד... (זה יכול לקחת כמה דקות)';
+  st.textContent = ''; log.style.display = 'none'; log.textContent = '';
+
+  try {
+    const r = await fetch('/api/process-photos', { method: 'POST' });
+    const d = await r.json();
+    if (!d.success) throw new Error(d.error || 'שגיאה לא ידועה');
+
+    st.textContent = `✓ ${d.ok} עובדו בהצלחה, ${d.fail} נכשלו/דולגו`;
+    st.style.color = d.fail ? '#c62828' : '#2d5a27';
+    log.textContent = (d.log || []).join('\n');
+    log.style.display = 'block';
+    loadPhotoStats();
+  } catch (e) {
+    st.textContent = '✗ ' + e.message; st.style.color = '#c62828';
+  } finally {
+    btn.disabled = false; btn.textContent = 'עבד תמונות ממתינות';
   }
 }
 
