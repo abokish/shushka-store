@@ -2,7 +2,7 @@
 /**
  * Plugin Name: שושקה — ניהול חנות
  * Description: ליקוט ומשלוח הזמנות — שושקה
- * Version: 5.7.17
+ * Version: 5.8.2
  */
 defined('ABSPATH') || exit;
 
@@ -5121,6 +5121,7 @@ function shpk_photo_search_handler() {
     $sql = "SELECT p.ID, p.post_title,
                    (SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id=p.ID AND meta_key='_sku' LIMIT 1) AS sku,
                    (SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id=p.ID AND meta_key='shpk_photo_pending' LIMIT 1) AS pending,
+                   (SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id=p.ID AND meta_key='shpk_needs_photo_update' LIMIT 1) AS needs_update,
                    (SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id=p.ID AND meta_key='_thumbnail_id' LIMIT 1) AS thumb_id
             FROM {$wpdb->posts} p
             WHERE $where
@@ -5133,7 +5134,7 @@ function shpk_photo_search_handler() {
         $status = $r->pending ? 'pending' : (shpk_photo_is_generic_image($pid) ? 'not_photographed' : 'done');
         $thumb  = $r->thumb_id ? wp_get_attachment_image_url((int)$r->thumb_id, 'thumbnail') : '';
         $results[] = ['id' => $pid, 'name' => $r->post_title, 'sku' => (string)$r->sku,
-                      'status' => $status, 'thumb' => $thumb ?: ''];
+                      'status' => $status, 'thumb' => $thumb ?: '', 'needs_update' => (bool) $r->needs_update];
     }
     if (ob_get_length()) ob_clean();
     wp_send_json_success($results);
@@ -5169,16 +5170,21 @@ function shpk_photo_get_product_handler() {
         : [];
 
     wp_send_json_success([
-        'id'             => $product_id,
-        'name'           => $product->get_name(),
-        'sku'            => $product->get_sku(),
-        'price'          => $product->get_regular_price(),
-        'category_id'    => $parent_cat_id,
-        'subcategory_id' => $sub_cat_id,
-        'brand_id'       => $brand_ids ? (int) $brand_ids[0] : 0,
-        'thumb'          => wp_get_attachment_image_url($product->get_image_id(), 'thumbnail') ?: '',
-        'status'         => shpk_photo_status($product_id),
-        'permalink'      => get_permalink($product_id) ?: '',
+        'id'                => $product_id,
+        'name'              => $product->get_name(),
+        'sku'               => $product->get_sku(),
+        'price'             => $product->get_regular_price(),
+        'description'       => $product->get_description(),
+        'stock_status'      => $product->get_stock_status(),
+        'visibility'        => $product->get_catalog_visibility(),
+        'category_id'       => $parent_cat_id,
+        'subcategory_id'    => $sub_cat_id,
+        'brand_id'          => $brand_ids ? (int) $brand_ids[0] : 0,
+        'thumb'             => wp_get_attachment_image_url($product->get_image_id(), 'thumbnail') ?: '',
+        'status'            => shpk_photo_status($product_id),
+        'needs_photo_update' => (bool) get_post_meta($product_id, 'shpk_needs_photo_update', true),
+        'reviewed'          => (bool) get_post_meta($product_id, 'shpk_data_reviewed', true),
+        'permalink'         => get_permalink($product_id) ?: '',
     ]);
 }
 
@@ -5203,6 +5209,7 @@ function shpk_photo_upload_handler() {
     set_post_thumbnail($product_id, $attach_id);
     update_post_meta($product_id, 'shpk_photo_pending', '1');
     update_post_meta($product_id, 'shpk_photo_raw_id', $attach_id);
+    delete_post_meta($product_id, 'shpk_needs_photo_update');
 
     if (ob_get_length()) ob_clean();
     wp_send_json_success([
@@ -5266,14 +5273,27 @@ function shpk_photo_update_details_handler() {
     $final_cat_id   = $sub_cat_id ?: $parent_cat_id;
     $brand_id       = absint($_POST['brand_id'] ?? 0);
     $new_brand_name = sanitize_text_field($_POST['new_brand_name'] ?? '');
+    $description    = isset($_POST['description']) ? wp_kses_post(wp_unslash($_POST['description'])) : null;
+    $stock_status   = sanitize_text_field($_POST['stock_status'] ?? '');
+    $visibility     = sanitize_text_field($_POST['visibility'] ?? '');
+    $needs_update   = isset($_POST['needs_photo_update']) ? sanitize_text_field($_POST['needs_photo_update']) : null;
 
     try {
         if ($name !== '') $product->set_name($name);
         if ($sku !== '') $product->set_sku($sku);
         if ($price !== '' && is_numeric($price)) $product->set_regular_price($price);
+        if ($description !== null) $product->set_description($description);
+        if (in_array($stock_status, ['instock', 'outofstock'], true)) $product->set_stock_status($stock_status);
+        if (in_array($visibility, ['visible', 'hidden'], true)) $product->set_catalog_visibility($visibility);
         $product->save();
     } catch (Exception $e) {
         wp_send_json_error($e->getMessage()); return;
+    }
+
+    if ($needs_update === '1') {
+        update_post_meta($product_id, 'shpk_needs_photo_update', '1');
+    } elseif ($needs_update === '0') {
+        delete_post_meta($product_id, 'shpk_needs_photo_update');
     }
 
     if ($final_cat_id) wp_set_object_terms($product_id, [$final_cat_id], 'product_cat');
@@ -5289,6 +5309,8 @@ function shpk_photo_update_details_handler() {
         }
     }
     if ($brand_id && taxonomy_exists('product_brand')) wp_set_object_terms($product_id, [$brand_id], 'product_brand');
+
+    update_post_meta($product_id, 'shpk_data_reviewed', '1');
 
     if (ob_get_length()) ob_clean();
     wp_send_json_success();
@@ -5485,6 +5507,7 @@ function shpk_photo_page($frontend = false) {
                     '<div class="spw-card-name">' + esc(p.name) + '</div>' +
                     '<div class="spw-card-sku">' + esc(p.sku || '') + '</div>' +
                 '</div>' +
+                (p.needs_update ? '<span class="spw-badge" style="background:#ffebee;color:#c62828" title="סומן מרחוק כצריך עדכון תמונה">🔧</span>' : '') +
                 '<span class="spw-badge spw-badge-' + p.status + '">' + badgeLabel[p.status] + '</span>';
             wrap.appendChild(card);
         });
@@ -5697,6 +5720,605 @@ function shpk_photo_page($frontend = false) {
     function esc(s) {
         return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }
+    })();
+    </script>
+    <?php
+}
+
+/* ═══════════════════════════════════════════════════════════
+   עדכון מידע מוצרים — עבודה מרחוק לפי קטגוריה/תת-קטגוריה (v5.8.0)
+   בלי מצלמה: שם, קטגוריה, מותג, מחיר, תיאור, מלאי, "נמכר/הוסתר".
+   ═══════════════════════════════════════════════════════════ */
+
+add_action('init', function () {
+    add_shortcode('shushka_data', function () {
+        ob_start();
+        shpk_data_page(true);
+        return ob_get_clean();
+    });
+});
+
+add_action('admin_menu', function () {
+    add_submenu_page('shushka-pick', 'עדכון מוצרים', '📝 עדכון מוצרים',
+        'manage_woocommerce', 'shushka-data', 'shpk_data_page');
+});
+
+/* ── AJAX: רשימת מוצרים בקטגוריה/תת-קטגוריה נבחרת ───────── */
+add_action('wp_ajax_shpk_data_list_products',        'shpk_data_list_products_handler');
+add_action('wp_ajax_nopriv_shpk_data_list_products', 'shpk_data_list_products_handler');
+function shpk_data_list_products_handler() {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!shpk_photo_auth_ok()) { wp_send_json_error('unauthorized'); return; }
+
+    $cat_id         = absint($_GET['category_id'] ?? 0);
+    $only_unreviewed = !isset($_GET['only_unreviewed']) || $_GET['only_unreviewed'] !== '0';
+    if (!$cat_id) { wp_send_json_error('קטגוריה חסרה'); return; }
+
+    $args = [
+        'post_type'      => 'product',
+        'post_status'    => 'publish',
+        'posts_per_page' => -1,
+        'orderby'        => 'title',
+        'order'          => 'ASC',
+        'tax_query'      => [[
+            'taxonomy' => 'product_cat',
+            'field'    => 'term_id',
+            'terms'    => $cat_id,
+        ]],
+    ];
+    if ($only_unreviewed) {
+        $args['meta_query'] = [[
+            'key'     => 'shpk_data_reviewed',
+            'compare' => 'NOT EXISTS',
+        ]];
+    }
+
+    $query    = new WP_Query($args);
+    $results  = [];
+    foreach ($query->posts as $post) {
+        $pid     = $post->ID;
+        $product = wc_get_product($pid);
+        if (!$product) continue;
+        $results[] = [
+            'id'         => $pid,
+            'name'       => $product->get_name(),
+            'thumb'      => wp_get_attachment_image_url($product->get_image_id(), 'thumbnail') ?: '',
+            'reviewed'   => (bool) get_post_meta($pid, 'shpk_data_reviewed', true),
+            'visibility' => $product->get_catalog_visibility(),
+            'photo_status' => shpk_photo_status($pid),
+        ];
+    }
+    wp_reset_postdata();
+
+    if (ob_get_length()) ob_clean();
+    wp_send_json_success($results);
+}
+
+/* ── AJAX: ייבוא תמונה ראשית מכתובת URL (למשל מגוגל תמונות) ── */
+add_action('wp_ajax_shpk_data_import_image_url',        'shpk_data_import_image_url_handler');
+add_action('wp_ajax_nopriv_shpk_data_import_image_url', 'shpk_data_import_image_url_handler');
+function shpk_data_import_image_url_handler() {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!shpk_photo_auth_ok()) { wp_send_json_error('unauthorized'); return; }
+
+    $product_id = absint($_POST['product_id'] ?? 0);
+    $url        = sanitize_text_field($_POST['url'] ?? '');
+    if (!$product_id || !get_post($product_id)) { wp_send_json_error('מוצר לא נמצא'); return; }
+    if (!preg_match('#^https?://#i', $url)) { wp_send_json_error('כתובת לא תקינה — נדרש קישור שמתחיל ב-http(s)'); return; }
+
+    require_once ABSPATH . 'wp-admin/includes/image.php';
+    require_once ABSPATH . 'wp-admin/includes/file.php';
+    require_once ABSPATH . 'wp-admin/includes/media.php';
+
+    // לא משתמשים ב-media_sideload_image(): היא מסתמכת על סיומת הקובץ ב-URL כדי לזהות
+    // שזו תמונה, וקישורי "העתק כתובת תמונה" מגוגל (ומקורות רבים אחרים) לא מסתיימים
+    // בסיומת תמונה — נכשלת בלי סיבה ברורה. כאן מורידים ידנית ומזהים לפי Content-Type
+    // האמיתי של השרת, ומחזירים הודעת שגיאה אמיתית כשזה נכשל.
+    $resp = wp_remote_get($url, ['timeout' => 20, 'redirection' => 5]);
+    if (is_wp_error($resp)) {
+        wp_send_json_error('הורדה נכשלה: ' . $resp->get_error_message());
+        return;
+    }
+    $code = wp_remote_retrieve_response_code($resp);
+    if ($code !== 200) {
+        wp_send_json_error("השרת של התמונה החזיר קוד $code (ולא 200 OK)");
+        return;
+    }
+    $content_type = strtolower(trim(explode(';', wp_remote_retrieve_header($resp, 'content-type'))[0] ?? ''));
+    $ext_by_type  = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp', 'image/gif' => 'gif'];
+    if (!isset($ext_by_type[$content_type])) {
+        wp_send_json_error("הקישור הזה לא מחזיר תמונה (Content-Type: " . ($content_type ?: 'לא ידוע') . "). " .
+            "בלחיצה ימנית על התמונה בגוגל יש שתי אפשרויות שונות — ודאו שבחרתם 'העתק קישור תמונה' (Copy image link/address) ולא 'העתק קישור' (Copy link) הרגיל.");
+        return;
+    }
+    $body = wp_remote_retrieve_body($resp);
+    if (!$body) { wp_send_json_error('הקישור החזיר תגובה ריקה'); return; }
+
+    $filename = 'product-' . $product_id . '-' . time() . '.' . $ext_by_type[$content_type];
+    $uploaded = wp_upload_bits($filename, null, $body);
+    if (!empty($uploaded['error'])) {
+        wp_send_json_error('שמירת הקובץ נכשלה: ' . $uploaded['error']);
+        return;
+    }
+
+    $attach_id = wp_insert_attachment([
+        'post_mime_type' => $content_type,
+        'post_title'      => sanitize_file_name($filename),
+        'post_status'     => 'inherit',
+        'post_parent'     => $product_id,
+    ], $uploaded['file'], $product_id, true);
+    if (is_wp_error($attach_id)) {
+        wp_send_json_error('יצירת קובץ המדיה נכשלה: ' . $attach_id->get_error_message());
+        return;
+    }
+    wp_update_attachment_metadata($attach_id, wp_generate_attachment_metadata($attach_id, $uploaded['file']));
+
+    set_post_thumbnail($product_id, $attach_id);
+    update_post_meta($product_id, 'shpk_photo_pending', '1');
+    update_post_meta($product_id, 'shpk_photo_raw_id', $attach_id);
+    delete_post_meta($product_id, 'shpk_needs_photo_update');
+
+    if (ob_get_length()) ob_clean();
+    wp_send_json_success(['thumb' => wp_get_attachment_image_url($attach_id, 'thumbnail')]);
+}
+
+/* ── עמוד עדכון המידע ─────────────────────────────────────── */
+function shpk_data_page($frontend = false) {
+    if (!shpk_check_pin()) { shpk_pin_form('כניסה לדף עדכון מוצרים'); return; }
+
+    $ajax_url = admin_url('admin-ajax.php');
+    $nonce    = wp_create_nonce('shushka_nonce');
+
+    $cats = get_terms(['taxonomy' => 'product_cat', 'hide_empty' => false, 'orderby' => 'name']);
+    $cats = is_array($cats) ? $cats : [];
+
+    $brand_tax_exists = taxonomy_exists('product_brand');
+    $brands = $brand_tax_exists
+        ? get_terms(['taxonomy' => 'product_brand', 'hide_empty' => false, 'orderby' => 'name'])
+        : [];
+    $brands = is_array($brands) ? $brands : [];
+    ?>
+    <style>
+    #sdw{font-family:Rubik,Arial,sans-serif;direction:rtl;max-width:480px;margin:0 auto;padding:14px;color:#2b2b2b}
+    #sdw h1{font-size:20px;color:#183625;margin-bottom:12px}
+    #sdw input[type=text],#sdw input[type=number],#sdw select,#sdw textarea{
+        width:100%;box-sizing:border-box;font-size:16px;padding:10px;border:1px solid #ccc;border-radius:8px;margin-bottom:8px;font-family:inherit}
+    #sdw textarea{resize:vertical}
+    #sdw label.sdw-field-label{font-size:12px;color:#777;display:block;margin-top:4px}
+    #sdw-start-btn{margin-top:6px}
+    .sdw-card{display:flex;align-items:center;gap:10px;background:#fff;border:1px solid #eee;border-radius:10px;
+        padding:8px 10px;margin-bottom:8px;cursor:pointer}
+    .sdw-card:hover{border-color:#183625}
+    .sdw-card img{width:46px;height:46px;object-fit:cover;border-radius:6px;background:#f2f2f2;flex-shrink:0}
+    .sdw-card-info{flex:1;min-width:0}
+    .sdw-card-name{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .sdw-badge{font-size:11px;font-weight:700;border-radius:10px;padding:2px 8px;white-space:nowrap}
+    .sdw-badge-reviewed{background:#e8f5e9;color:#2e7d32}
+    .sdw-badge-hidden{background:#eee;color:#555}
+    #sdw-edit,#sdw-list,#sdw-pick{display:none}
+    #sdw-pick{display:block}
+    #sdw-progress{font-size:13px;color:#888;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
+    #sdw-progress button{background:none;border:none;color:#183625;font-size:20px;cursor:pointer;padding:0 8px}
+    .sdw-btn{display:block;width:100%;padding:12px;border:none;border-radius:10px;font-size:15px;font-weight:600;
+        cursor:pointer;margin-bottom:8px;text-align:center}
+    .sdw-btn-main{background:#183625;color:#fff}
+    .sdw-btn-main.sdw-saved{background:#2e7d32}
+    .sdw-btn-main:disabled{opacity:.65;cursor:default}
+    .sdw-btn-sec{background:#eee;color:#333}
+    .sdw-msg{text-align:center;color:#999;font-size:13px;padding:16px}
+    #sdw-back{background:none;border:none;color:#888;font-size:13px;cursor:pointer;margin-top:4px;margin-bottom:10px;text-decoration:underline}
+    .sdw-toggle{display:flex;gap:8px;margin-bottom:8px}
+    .sdw-toggle button{flex:1;padding:12px 6px;border:2px solid #ccc;border-radius:10px;background:#fff;color:#555;
+        font-size:14px;font-weight:600;cursor:pointer;font-family:inherit}
+    .sdw-toggle button.sdw-on{border-color:#183625;background:#183625;color:#fff}
+    .sdw-sku-display{font-size:15px;color:#555;background:#f7f7f7;border-radius:8px;padding:10px;margin-bottom:8px}
+    #sdw-thumb{width:100%;max-width:180px;display:block;margin:6px auto 10px;border-radius:8px;background:#f2f2f2}
+    #sdw-paste-zone{border:2px dashed #ccc;border-radius:8px;padding:14px;text-align:center;color:#999;font-size:13px;
+        margin-bottom:4px;min-height:20px}
+    #sdw-paste-zone:focus{outline:2px solid #183625;color:#555}
+    #sdw-paste-status{font-size:13px;border-radius:8px;padding:8px 10px;margin-bottom:8px;display:none;font-weight:600}
+    #sdw-paste-status.sdw-paste-ok{display:block;background:#e8f5e9;color:#2e7d32}
+    #sdw-paste-status.sdw-paste-err{display:block;background:#ffebee;color:#c62828}
+    #sdw-toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#183625;color:#fff;
+        padding:10px 20px;border-radius:20px;font-size:13px;opacity:0;transition:.25s;pointer-events:none;z-index:999}
+    #sdw-toast.show{opacity:1}
+    #woofc-count{display:none !important}
+    </style>
+
+    <div id="sdw">
+        <h1>📝 עדכון מידע מוצרים</h1>
+
+        <div id="sdw-pick">
+            <label class="sdw-field-label">קטגוריה</label>
+            <select id="sdw-cat-parent"></select>
+            <label class="sdw-field-label">תת-קטגוריה</label>
+            <select id="sdw-cat-sub"></select>
+            <button class="sdw-btn sdw-btn-main" id="sdw-start-btn" onclick="sdwStart()">▶ התחל</button>
+        </div>
+
+        <div id="sdw-list">
+            <button id="sdw-back-from-list" class="sdw-btn sdw-btn-sec" onclick="sdwBackToPick()">← בחירת קטגוריה אחרת</button>
+            <div id="sdw-list-results"></div>
+        </div>
+
+        <div id="sdw-edit">
+            <div id="sdw-progress">
+                <button onclick="sdwStep(-1)">→</button>
+                <span id="sdw-progress-text"></span>
+                <button onclick="sdwStep(1)">←</button>
+            </div>
+            <button id="sdw-back" onclick="sdwBackToList()">← חזרה לרשימה</button>
+
+            <label class="sdw-field-label">שם מוצר</label>
+            <input type="text" id="sdw-name" style="font-weight:600">
+
+            <label class="sdw-field-label">קטגוריה</label>
+            <select id="sdw-edit-cat-parent"></select>
+            <label class="sdw-field-label">תת-קטגוריה</label>
+            <select id="sdw-edit-cat-sub"></select>
+
+            <?php if ($brand_tax_exists): ?>
+            <label class="sdw-field-label">מותג</label>
+            <select id="sdw-brand" onchange="sdwOnBrandChange()">
+                <option value="0">— ללא שינוי —</option>
+                <?php foreach ($brands as $b): ?>
+                    <option value="<?php echo (int)$b->term_id; ?>"><?php echo esc_html($b->name); ?></option>
+                <?php endforeach; ?>
+                <option value="__new__">+ מותג חדש...</option>
+            </select>
+            <input type="text" id="sdw-brand-new" placeholder="שם המותג החדש" style="display:none">
+            <?php endif; ?>
+
+            <label class="sdw-field-label">מחיר רגיל (₪)</label>
+            <input type="number" id="sdw-price" step="0.1" min="0">
+
+            <label class="sdw-field-label">ברקוד / SKU</label>
+            <div class="sdw-sku-display" id="sdw-sku-display">—</div>
+
+            <label class="sdw-field-label">מלאי</label>
+            <div class="sdw-toggle" id="sdw-stock-toggle">
+                <button type="button" data-val="instock" onclick="sdwSetToggle('stock','instock')">✅ במלאי</button>
+                <button type="button" data-val="outofstock" onclick="sdwSetToggle('stock','outofstock')">❌ אין במלאי</button>
+            </div>
+
+            <label class="sdw-field-label">מכירה</label>
+            <div class="sdw-toggle" id="sdw-visibility-toggle">
+                <button type="button" data-val="visible" onclick="sdwSetToggle('visibility','visible')">🟢 נמכר</button>
+                <button type="button" data-val="hidden" onclick="sdwSetToggle('visibility','hidden')">⚫ הופסק להימכר</button>
+            </div>
+
+            <label class="sdw-field-label">תיאור</label>
+            <textarea id="sdw-description" rows="4"></textarea>
+
+            <label class="sdw-field-label">תמונה</label>
+            <img id="sdw-thumb" src="">
+            <span class="sdw-badge" id="sdw-photo-status-badge"></span>
+            <div class="sdw-toggle" id="sdw-needs-update-toggle" style="margin-top:8px">
+                <button type="button" data-val="0" onclick="sdwSetToggle('needsUpdate','0')">📷 תמונה תקינה</button>
+                <button type="button" data-val="1" onclick="sdwSetToggle('needsUpdate','1')">🔧 לעדכן תמונה</button>
+            </div>
+            <button class="sdw-btn sdw-btn-sec" onclick="sdwOpenGoogleImages()">🔎 ייבוא תמונה מגוגל</button>
+            <div id="sdw-paste-zone" contenteditable="true">הדביקו כאן קישור לתמונה (או את התמונה עצמה) אחרי שבחרתם בגוגל תמונות</div>
+            <div id="sdw-paste-status"></div>
+
+            <a id="sdw-view-link" href="#" target="_blank" style="display:none;text-align:center;font-size:13px;color:#183625;margin-bottom:10px">🔗 צפה במוצר באתר ↗</a>
+
+            <button class="sdw-btn sdw-btn-main" id="sdw-save-btn" onclick="sdwSaveAndNext()">💾 שמור והבא</button>
+        </div>
+    </div>
+    <div id="sdw-toast"></div>
+
+    <script>
+    (function(){
+    var AJAX = <?php echo json_encode($ajax_url); ?>;
+    var NONCE = <?php echo json_encode($nonce); ?>;
+
+    var cats = <?php echo json_encode(array_map(function($c){
+        return ['id' => (int) $c->term_id, 'name' => $c->name, 'parent' => (int) $c->parent, 'slug' => $c->slug];
+    }, $cats)); ?>;
+    var catParents = cats.filter(function(c){ return c.parent === 0 && c.slug !== 'uncategorized'; });
+    var catChildren = {};
+    cats.filter(function(c){ return c.parent !== 0; }).forEach(function(c){
+        (catChildren[c.parent] = catChildren[c.parent] || []).push(c);
+    });
+
+    var queue = [];      // [{id, name, thumb, reviewed, visibility, photo_status}, ...]
+    var queueIdx = -1;
+    var curProduct = null;
+    var dirty = false;
+    var toggles = {stock: '', visibility: '', needsUpdate: ''};
+
+    function toast(msg) {
+        var t = document.getElementById('sdw-toast');
+        t.textContent = msg; t.classList.add('show');
+        setTimeout(function(){ t.classList.remove('show'); }, 2500);
+    }
+    function esc(s) {
+        return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+    function showScreen(name) {
+        ['sdw-pick', 'sdw-list', 'sdw-edit'].forEach(function(id){
+            document.getElementById(id).style.display = (id === name) ? 'block' : 'none';
+        });
+    }
+
+    // ── מסך 1: בחירת קטגוריה ────────────────────────────────
+    function fillSelect(sel, options, placeholder) {
+        sel.innerHTML = '<option value="0">' + placeholder + '</option>';
+        options.forEach(function(c){
+            sel.innerHTML += '<option value="' + c.id + '">' + esc(c.name) + '</option>';
+        });
+    }
+    var pickParent = document.getElementById('sdw-cat-parent');
+    var pickSub    = document.getElementById('sdw-cat-sub');
+    fillSelect(pickParent, catParents, '— קטגוריה —');
+    pickParent.addEventListener('change', function(){
+        fillSelect(pickSub, catChildren[+this.value] || [], '— תת-קטגוריה (הכל) —');
+    });
+
+    window.sdwStart = function() {
+        var subId = +pickSub.value || 0;
+        var parentId = +pickParent.value || 0;
+        var catId = subId || parentId;
+        if (!catId) { toast('בחרו קטגוריה'); return; }
+        loadQueue(catId);
+    };
+
+    function loadQueue(catId) {
+        document.getElementById('sdw-list-results').innerHTML = '<div class="sdw-msg">🔍 טוען...</div>';
+        showScreen('sdw-list');
+        fetch(AJAX + '?action=shpk_data_list_products&nonce=' + NONCE + '&category_id=' + catId)
+            .then(function(r){ return r.json(); }).then(function(d){
+                if (!d.success) { toast('שגיאה בטעינה'); return; }
+                queue = d.data;
+                queueIdx = -1;
+                renderList();
+                var firstUnreviewed = queue.findIndex(function(p){ return !p.reviewed; });
+                if (firstUnreviewed >= 0) {
+                    openProductAt(firstUnreviewed);
+                } else if (queue.length) {
+                    document.getElementById('sdw-list-results').innerHTML = '<div class="sdw-msg">🎉 כל המוצרים בתת-קטגוריה הזו נבדקו</div>';
+                } else {
+                    document.getElementById('sdw-list-results').innerHTML = '<div class="sdw-msg">אין מוצרים בקטגוריה הזו</div>';
+                }
+            });
+    }
+
+    function renderList() {
+        var wrap = document.getElementById('sdw-list-results');
+        wrap.innerHTML = '';
+        queue.forEach(function(p, i){
+            var card = document.createElement('div');
+            card.className = 'sdw-card';
+            card.onclick = function(){ openProductAt(i); };
+            card.innerHTML =
+                '<img src="' + (p.thumb || '') + '">' +
+                '<div class="sdw-card-info"><div class="sdw-card-name">' + esc(p.name) + '</div></div>' +
+                (p.visibility === 'hidden' ? '<span class="sdw-badge sdw-badge-hidden">⚫ מוסתר</span>' : '') +
+                (p.reviewed ? '<span class="sdw-badge sdw-badge-reviewed">✓ נבדק</span>' : '');
+            wrap.appendChild(card);
+        });
+    }
+
+    window.sdwBackToPick = function() {
+        if (!confirmLeaveEdit()) return;
+        showScreen('sdw-pick');
+    };
+    window.sdwBackToList = function() {
+        if (!confirmLeaveEdit()) return;
+        showScreen('sdw-list');
+    };
+
+    // ── מסך 3: עריכת מוצר ───────────────────────────────────
+    function confirmLeaveEdit() {
+        if (curProduct && dirty) {
+            return confirm('יש שינויים שלא נשמרו במוצר הנוכחי. לצאת בלי לשמור?');
+        }
+        return true;
+    }
+
+    var editParent = document.getElementById('sdw-edit-cat-parent');
+    var editSub    = document.getElementById('sdw-edit-cat-sub');
+    function buildEditCatSelects(parentId, subId) {
+        fillSelect(editParent, catParents, '— קטגוריה —');
+        editParent.value = String(parentId);
+        rebuildEditSub(parentId, subId);
+    }
+    function rebuildEditSub(parentId, subId) {
+        fillSelect(editSub, catChildren[parentId] || [], '— תת-קטגוריה —');
+        editSub.value = String(subId);
+    }
+    editParent.addEventListener('change', function(){ rebuildEditSub(+this.value || 0, 0); markDirty(); });
+
+    var photoStatusLabel = {not_photographed: '⚪ לא צולם', pending: '🟡 ממתין לעיבוד', done: '🟢 צולם'};
+
+    function openProductAt(i) {
+        if (!confirmLeaveEdit()) return;
+        queueIdx = i;
+        var p = queue[i];
+        fetch(AJAX + '?action=shpk_photo_get_product&nonce=' + NONCE + '&id=' + p.id)
+            .then(function(r){ return r.json(); }).then(function(d){
+                if (!d.success) { toast('שגיאה בטעינת מוצר'); return; }
+                curProduct = d.data;
+                document.getElementById('sdw-name').value = curProduct.name || '';
+                document.getElementById('sdw-price').value = curProduct.price || '';
+                document.getElementById('sdw-sku-display').textContent = curProduct.sku || '— אין —';
+                document.getElementById('sdw-description').value = curProduct.description ? curProduct.description.replace(/<[^>]+>/g, '') : '';
+                document.getElementById('sdw-thumb').src = curProduct.thumb || '';
+                document.getElementById('sdw-photo-status-badge').textContent = photoStatusLabel[curProduct.status] || '';
+                var link = document.getElementById('sdw-view-link');
+                if (curProduct.permalink) { link.href = curProduct.permalink; link.style.display = 'block'; }
+                else { link.style.display = 'none'; }
+
+                buildEditCatSelects(curProduct.category_id || 0, curProduct.subcategory_id || 0);
+                var brandSel = document.getElementById('sdw-brand');
+                if (brandSel) {
+                    brandSel.value = curProduct.brand_id ? String(curProduct.brand_id) : '0';
+                    document.getElementById('sdw-brand-new').style.display = 'none';
+                    document.getElementById('sdw-brand-new').value = '';
+                }
+                toggles.stock = curProduct.stock_status === 'outofstock' ? 'outofstock' : 'instock';
+                toggles.visibility = curProduct.visibility === 'hidden' ? 'hidden' : 'visible';
+                toggles.needsUpdate = curProduct.needs_photo_update ? '1' : '0';
+                refreshToggleUI();
+
+                document.getElementById('sdw-progress-text').textContent = 'מוצר ' + (queueIdx + 1) + ' מתוך ' + queue.length;
+                dirty = false;
+                resetSaveBtn();
+                showScreen('sdw-edit');
+            });
+    }
+
+    window.sdwStep = function(delta) {
+        var next = queueIdx + delta;
+        if (next < 0 || next >= queue.length) { toast(delta > 0 ? 'זה המוצר האחרון בתור' : 'זה המוצר הראשון בתור'); return; }
+        openProductAt(next);
+    };
+
+    window.sdwSetToggle = function(group, val) {
+        toggles[group] = val;
+        refreshToggleUI();
+        markDirty();
+    };
+    function refreshToggleUI() {
+        [['sdw-stock-toggle', 'stock'], ['sdw-visibility-toggle', 'visibility'], ['sdw-needs-update-toggle', 'needsUpdate']].forEach(function(pair){
+            var wrap = document.getElementById(pair[0]);
+            Array.prototype.forEach.call(wrap.children, function(btn){
+                btn.classList.toggle('sdw-on', btn.getAttribute('data-val') === toggles[pair[1]]);
+            });
+        });
+    }
+
+    window.sdwOnBrandChange = function() {
+        var brandSel = document.getElementById('sdw-brand');
+        var newInput = document.getElementById('sdw-brand-new');
+        newInput.style.display = (brandSel.value === '__new__') ? 'block' : 'none';
+        if (brandSel.value === '__new__') newInput.focus();
+    };
+
+    var saveBtn = document.getElementById('sdw-save-btn');
+    function resetSaveBtn() {
+        saveBtn.disabled = false;
+        saveBtn.textContent = '💾 שמור והבא';
+        saveBtn.classList.remove('sdw-saved');
+    }
+    function markDirty() { dirty = true; resetSaveBtn(); }
+    ['sdw-name', 'sdw-price', 'sdw-description', 'sdw-edit-cat-sub', 'sdw-brand', 'sdw-brand-new'].forEach(function(id){
+        var el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener('input', markDirty);
+        el.addEventListener('change', markDirty);
+    });
+
+    window.sdwOpenGoogleImages = function() {
+        if (!curProduct) return;
+        var brandSel = document.getElementById('sdw-brand');
+        var brandName = brandSel && brandSel.value !== '0' && brandSel.value !== '__new__'
+            ? (brandSel.options[brandSel.selectedIndex].textContent || '') : '';
+        var q = (document.getElementById('sdw-name').value || '') + ' ' + brandName;
+        window.open('https://www.google.com/search?tbm=isch&q=' + encodeURIComponent(q.trim()), '_blank');
+    };
+
+    var pasteStatusEl = document.getElementById('sdw-paste-status');
+    function pasteStatus(kind, msg) {
+        // kind: 'ok' | 'err' | 'busy'. נשאר על המסך עד הפעולה הבאה — לא נעלם לבד,
+        // כדי שכישלון (כמו URL שלא באמת מחזיר תמונה) לא "יברח" כהודעת טוסט חולפת.
+        pasteStatusEl.className = kind === 'ok' ? 'sdw-paste-ok' : (kind === 'err' ? 'sdw-paste-err' : '');
+        pasteStatusEl.style.display = 'block';
+        pasteStatusEl.textContent = msg;
+    }
+
+    document.getElementById('sdw-paste-zone').addEventListener('paste', function(e) {
+        e.preventDefault();
+        if (!curProduct) return;
+        var items = (e.clipboardData && e.clipboardData.items) || [];
+        for (var i = 0; i < items.length; i++) {
+            if (items[i].kind === 'file' && items[i].type.indexOf('image/') === 0) {
+                var blob = items[i].getAsFile();
+                uploadPastedBlob(blob);
+                return;
+            }
+        }
+        var text = (e.clipboardData && e.clipboardData.getData('text')) || '';
+        text = text.trim();
+        if (/^https?:\/\//i.test(text)) {
+            importImageUrl(text);
+        } else {
+            pasteStatus('err', '⚠ לא זוהתה תמונה או קישור בלוח. נסו "העתק כתובת התמונה" בגוגל ואז הדביקו כאן.');
+        }
+    });
+
+    function uploadPastedBlob(blob) {
+        var fd = new FormData();
+        fd.append('action', 'shpk_photo_upload');
+        fd.append('nonce', NONCE);
+        fd.append('product_id', curProduct.id);
+        fd.append('photo', blob, 'pasted.png');
+        pasteStatus('busy', '⏳ מעלה תמונה...');
+        fetch(AJAX, {method: 'POST', body: fd}).then(function(r){ return r.json(); }).then(function(d){
+            if (!d.success) { pasteStatus('err', '⚠ שגיאה בהעלאה: ' + (d.data || '')); return; }
+            document.getElementById('sdw-thumb').src = d.data.thumb || '';
+            document.getElementById('sdw-photo-status-badge').textContent = photoStatusLabel.pending;
+            toggles.needsUpdate = '0'; refreshToggleUI();
+            pasteStatus('ok', '✓ התמונה הועלתה בהצלחה');
+        }).catch(function(){ pasteStatus('err', '⚠ שגיאת תקשורת בהעלאה — בדקו חיבור ונסו שוב'); });
+    }
+    function importImageUrl(url) {
+        var fd = new URLSearchParams({action: 'shpk_data_import_image_url', nonce: NONCE, product_id: curProduct.id, url: url});
+        pasteStatus('busy', '⏳ מייבא תמונה מהקישור...');
+        fetch(AJAX, {method: 'POST', body: fd}).then(function(r){ return r.json(); }).then(function(d){
+            if (!d.success) { pasteStatus('err', '⚠ ' + (d.data || 'שגיאה לא ידועה')); return; }
+            document.getElementById('sdw-thumb').src = d.data.thumb || '';
+            document.getElementById('sdw-photo-status-badge').textContent = photoStatusLabel.pending;
+            toggles.needsUpdate = '0'; refreshToggleUI();
+            pasteStatus('ok', '✓ התמונה יובאה בהצלחה');
+        }).catch(function(){ pasteStatus('err', '⚠ שגיאת תקשורת בייבוא — בדקו חיבור ונסו שוב'); });
+    }
+
+    window.sdwSaveAndNext = function() {
+        if (!curProduct) return;
+        var brandSel = document.getElementById('sdw-brand');
+        var isNewBrand = brandSel && brandSel.value === '__new__';
+        var fd = new URLSearchParams({
+            action: 'shpk_photo_update_details',
+            nonce: NONCE,
+            product_id: curProduct.id,
+            name: document.getElementById('sdw-name').value.trim(),
+            price: document.getElementById('sdw-price').value,
+            description: document.getElementById('sdw-description').value,
+            category_id: editParent.value,
+            subcategory_id: editSub.value,
+            brand_id: (brandSel && !isNewBrand) ? brandSel.value : 0,
+            new_brand_name: isNewBrand ? document.getElementById('sdw-brand-new').value.trim() : '',
+            stock_status: toggles.stock,
+            visibility: toggles.visibility,
+            needs_photo_update: toggles.needsUpdate,
+        });
+        saveBtn.disabled = true;
+        saveBtn.textContent = '⏳ שומר...';
+        fetch(AJAX, {method: 'POST', body: fd}).then(function(r){ return r.json(); }).then(function(d){
+            if (!d.success) { resetSaveBtn(); toast('שגיאה: ' + (d.data || '')); return; }
+            dirty = false;
+            queue[queueIdx].reviewed = true;
+            queue[queueIdx].name = document.getElementById('sdw-name').value.trim();
+            queue[queueIdx].visibility = toggles.visibility;
+            var next = queue.findIndex(function(p, idx){ return idx > queueIdx && !p.reviewed; });
+            if (next < 0) next = queue.findIndex(function(p){ return !p.reviewed; });
+            if (next >= 0) {
+                toast('נשמר ✓');
+                openProductAt(next);
+            } else {
+                renderList();
+                showScreen('sdw-list');
+                document.getElementById('sdw-list-results').insertAdjacentHTML('afterbegin',
+                    '<div class="sdw-msg">🎉 כל המוצרים בתת-קטגוריה הזו נבדקו</div>');
+                toast('נשמר ✓ — סיימת את התת-קטגוריה!');
+            }
+        }).catch(function(){
+            resetSaveBtn();
+            toast('שגיאה בשמירה — בדוק חיבור ונסה שוב');
+        });
+    };
     })();
     </script>
     <?php
