@@ -2,7 +2,7 @@
 /**
  * Plugin Name: שושקה — ניהול חנות
  * Description: ליקוט ומשלוח הזמנות — שושקה
- * Version: 5.8.2
+ * Version: 5.8.3
  */
 defined('ABSPATH') || exit;
 
@@ -5862,6 +5862,32 @@ function shpk_data_import_image_url_handler() {
     wp_send_json_success(['thumb' => wp_get_attachment_image_url($attach_id, 'thumbnail')]);
 }
 
+/* ── AJAX: שינוי שם מותג (term גלובלי — משפיע על כל המוצרים שלו) ── */
+add_action('wp_ajax_shpk_data_rename_brand',        'shpk_data_rename_brand_handler');
+add_action('wp_ajax_nopriv_shpk_data_rename_brand', 'shpk_data_rename_brand_handler');
+function shpk_data_rename_brand_handler() {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!shpk_photo_auth_ok()) { wp_send_json_error('unauthorized'); return; }
+    if (!taxonomy_exists('product_brand')) { wp_send_json_error('טקסונומיית מותג לא קיימת'); return; }
+
+    $term_id  = absint($_POST['term_id'] ?? 0);
+    $new_name = sanitize_text_field($_POST['new_name'] ?? '');
+    if (!$term_id || !get_term($term_id, 'product_brand')) { wp_send_json_error('מותג לא נמצא'); return; }
+    if ($new_name === '') { wp_send_json_error('שם חדש חסר'); return; }
+
+    $existing = get_term_by('name', $new_name, 'product_brand');
+    if ($existing && (int) $existing->term_id !== $term_id) {
+        wp_send_json_error('כבר קיים מותג בשם הזה — למיזוג בין שני מותגים צריך טיפול ידני');
+        return;
+    }
+
+    $result = wp_update_term($term_id, 'product_brand', ['name' => $new_name]);
+    if (is_wp_error($result)) { wp_send_json_error($result->get_error_message()); return; }
+
+    if (ob_get_length()) ob_clean();
+    wp_send_json_success(['term_id' => $term_id, 'name' => $new_name]);
+}
+
 /* ── עמוד עדכון המידע ─────────────────────────────────────── */
 function shpk_data_page($frontend = false) {
     if (!shpk_check_pin()) { shpk_pin_form('כניסה לדף עדכון מוצרים'); return; }
@@ -5959,13 +5985,17 @@ function shpk_data_page($frontend = false) {
 
             <?php if ($brand_tax_exists): ?>
             <label class="sdw-field-label">מותג</label>
-            <select id="sdw-brand" onchange="sdwOnBrandChange()">
-                <option value="0">— ללא שינוי —</option>
-                <?php foreach ($brands as $b): ?>
-                    <option value="<?php echo (int)$b->term_id; ?>"><?php echo esc_html($b->name); ?></option>
-                <?php endforeach; ?>
-                <option value="__new__">+ מותג חדש...</option>
-            </select>
+            <div style="display:flex;gap:6px;align-items:center">
+                <select id="sdw-brand" onchange="sdwOnBrandChange()" style="flex:1;margin-bottom:0">
+                    <option value="0">— ללא שינוי —</option>
+                    <?php foreach ($brands as $b): ?>
+                        <option value="<?php echo (int)$b->term_id; ?>"><?php echo esc_html($b->name); ?></option>
+                    <?php endforeach; ?>
+                    <option value="__new__">+ מותג חדש...</option>
+                </select>
+                <button type="button" onclick="sdwRenameBrand()" title="שנה שם למותג הנבחר (ישתנה בכל המוצרים שלו)"
+                    style="flex-shrink:0;height:44px;padding:0 12px;border:1px solid #ccc;border-radius:8px;background:#fff;font-size:17px;cursor:pointer">✏️</button>
+            </div>
             <input type="text" id="sdw-brand-new" placeholder="שם המותג החדש" style="display:none">
             <?php endif; ?>
 
@@ -6194,6 +6224,27 @@ function shpk_data_page($frontend = false) {
         var newInput = document.getElementById('sdw-brand-new');
         newInput.style.display = (brandSel.value === '__new__') ? 'block' : 'none';
         if (brandSel.value === '__new__') newInput.focus();
+    };
+
+    window.sdwRenameBrand = function() {
+        var brandSel = document.getElementById('sdw-brand');
+        if (!brandSel || brandSel.value === '0' || brandSel.value === '__new__') {
+            toast('בחרו מותג קיים לפני שינוי שם'); return;
+        }
+        var termId = brandSel.value;
+        var opt = brandSel.options[brandSel.selectedIndex];
+        var currentName = opt.textContent;
+        var newName = prompt('שם חדש למותג "' + currentName + '" (ישתנה בכל המוצרים שמשתמשים בו):', currentName);
+        if (newName === null) return;
+        newName = newName.trim();
+        if (!newName || newName === currentName) return;
+
+        var fd = new URLSearchParams({action: 'shpk_data_rename_brand', nonce: NONCE, term_id: termId, new_name: newName});
+        fetch(AJAX, {method: 'POST', body: fd}).then(function(r){ return r.json(); }).then(function(d){
+            if (!d.success) { toast('שגיאה: ' + (d.data || '')); return; }
+            opt.textContent = d.data.name;
+            toast('✓ שם המותג עודכן בהצלחה');
+        }).catch(function(){ toast('שגיאת תקשורת — נסו שוב'); });
     };
 
     var saveBtn = document.getElementById('sdw-save-btn');
