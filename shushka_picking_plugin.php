@@ -2,7 +2,7 @@
 /**
  * Plugin Name: שושקה — ניהול חנות
  * Description: ליקוט ומשלוח הזמנות — שושקה
- * Version: 5.8.3
+ * Version: 5.14.2
  */
 defined('ABSPATH') || exit;
 
@@ -187,7 +187,7 @@ add_action('admin_menu', function () {
         'manage_woocommerce', 'shushka-pick', 'shpk_pick_page');
     add_submenu_page('shushka-pick', 'דף השליח', '🚚 משלוח',
         'manage_woocommerce', 'shushka-deliver', 'shpk_deliver_page');
-    add_submenu_page('shushka-pick', 'הגדרות PIN', '⚙️ קוד PIN',
+    add_submenu_page('shushka-pick', 'הגדרות', '⚙️ הגדרות',
         'manage_woocommerce', 'shushka-pin', 'shpk_pin_settings');
     add_submenu_page('shushka-pick', 'סנכרון קופה', '🔄 סנכרון קופה',
         'manage_woocommerce', 'shushka-prices', 'shpk_prices_page');
@@ -199,51 +199,233 @@ add_action('admin_init', function() {
     if (isset($_POST['shushka_save_pin']) && current_user_can('manage_woocommerce')) {
         check_admin_referer('shushka_pin_save');
         update_option('shushka_pick_pin', sanitize_text_field($_POST['new_pin']));
-        add_settings_error('shushka_pin', 'saved', 'קוד PIN עודכן בהצלחה.', 'success');
+        if (isset($_POST['shushka_whatsapp_phone'])) {
+            // ספרות בלבד, בפורמט בינלאומי בלי + (כמו שwa.me מצפה, למשל 972501234567)
+            $phone = preg_replace('/\D+/', '', $_POST['shushka_whatsapp_phone']);
+            update_option('shushka_whatsapp_phone', $phone);
+        }
+        add_settings_error('shushka_pin', 'saved', 'ההגדרות עודכנו בהצלחה.', 'success');
     }
 });
 
-function shpk_pin_settings() {
-    $pin = get_option('shushka_pick_pin', '1234');
-    settings_errors('shushka_pin');
-    echo '<div class="wrap" dir="rtl"><h1>⚙️ קוד PIN לדפי הליקוט</h1>';
-    echo '<form method="post">';
-    wp_nonce_field('shushka_pin_save');
-    echo '<table class="form-table"><tr><th>קוד PIN נוכחי:</th><td><strong>' . esc_html($pin) . '</strong></td></tr>';
-    echo '<tr><th>קוד PIN חדש:</th><td><input type="number" name="new_pin" min="1000" max="99999999" placeholder="לפחות 4 ספרות" style="font-size:18px;width:160px;padding:6px;"></td></tr></table>';
-    echo '<input type="hidden" name="shushka_save_pin" value="1">';
-    submit_button('שמור קוד');
-    echo '</form></div>';
+/* ── מספר הוואטסאפ של החנות — מקור אחד, בלי לשכפל/לקבע בקוד.
+   נקרא ע"י כפתור "הודיעו לי כשחוזר למלאי" (ראו shpk_restock_*), כך
+   שאם המספר משתנה בעתיד אין צורך בהעלאת גרסה חדשה של התוסף. ── */
+function shpk_whatsapp_phone() {
+    return get_option('shushka_whatsapp_phone', '972544663712');
 }
 
-/* ── ייצוא הזמנות נארזות — נגיש לקופאי (PIN) מכל עמוד ── */
+function shpk_pin_settings() {
+    $pin   = get_option('shushka_pick_pin', '1234');
+    $phone = shpk_whatsapp_phone();
+    settings_errors('shushka_pin');
+    echo '<div class="wrap" dir="rtl"><h1>⚙️ הגדרות דפי שירות</h1>';
+    echo '<form method="post">';
+    wp_nonce_field('shushka_pin_save');
+    echo '<table class="form-table">';
+    echo '<tr><th>קוד PIN נוכחי (לליקוט / משלוח / צילום / עדכון מוצרים):</th><td><strong>' . esc_html($pin) . '</strong></td></tr>';
+    echo '<tr><th>קוד PIN חדש:</th><td><input type="number" name="new_pin" min="1000" max="99999999" placeholder="לפחות 4 ספרות" style="font-size:18px;width:160px;padding:6px;"></td></tr>';
+    echo '<tr><th>מספר וואטסאפ של החנות:</th><td><input type="text" name="shushka_whatsapp_phone" value="' . esc_attr($phone) . '" placeholder="972501234567" style="font-size:18px;width:220px;padding:6px;" dir="ltr">';
+    echo '<p class="description">בפורמט בינלאומי בלי + ובלי רווחים/מקפים (כמו 972501234567). משמש לכפתור "הודיעו לי כשחוזר למלאי" בעמוד מוצר שאזל.</p></td></tr>';
+    echo '</table>';
+    echo '<input type="hidden" name="shushka_save_pin" value="1">';
+    submit_button('שמור הגדרות');
+    echo '</form>';
+
+    // ── באנר משלוח — הועבר לכאן מדף "ניהול מוצרים" (לא קשור לניהול
+    // מוצרים, שייך בטבעיות לדף ההגדרות הכללי) ──
+    $wp_rest    = rtrim(rest_url('wp/v2'), '/');
+    $wp_nonce   = wp_create_nonce('wp_rest');
+    $shpk_nonce = wp_create_nonce('shushka_nonce');
+    $ajax_url   = admin_url('admin-ajax.php');
+    ?>
+    <hr style="margin:30px 0 20px;max-width:600px">
+    <h2>📦 באנר משלוח</h2>
+    <table class="form-table" style="max-width:600px">
+      <tr><th>תאריך המשלוח הבא:</th><td>
+        <input id="shpk-ship-date" type="date" style="font-size:16px;padding:6px;width:180px" onchange="shpkUpdateDatePreview()">
+        <span id="shpk-date-preview" style="font-style:italic;color:#666;margin-right:8px"></span>
+      </td></tr>
+      <tr><th>הערה נוספת (אופציונלי):</th><td>
+        <input id="shpk-ship-extra" type="text" style="font-size:16px;padding:6px;width:280px">
+      </td></tr>
+      <tr><th></th><td>
+        <button type="button" class="button button-primary" onclick="shpkUpdateShipping()">עדכן באנר בחנות ↑</button>
+        <span id="shpk-ship-status" style="margin-right:10px"></span>
+        <p class="description">לבדיקה שההודעה מופיעה: פתח חלון גלישה פרטי (כדי לעקוף "הבנתי ✓" שכבר נסגר בגלישה הרגילה).</p>
+      </td></tr>
+    </table>
+    <script>
+    (function(){
+    var WP_REST    = <?php echo json_encode($wp_rest); ?>;
+    var WP_NONCE   = <?php echo json_encode($wp_nonce); ?>;
+    var AJAX_URL   = <?php echo json_encode($ajax_url); ?>;
+    var SHPK_NONCE = <?php echo json_encode($shpk_nonce); ?>;
+    var shippingWidgetId = 'block-26';
+
+    function apiHdrs() { return {'X-WP-Nonce': WP_NONCE, 'Content-Type': 'application/json'}; }
+    function wpPut(path, body) { return fetch(WP_REST + path, {method:'PUT', headers: apiHdrs(), body: JSON.stringify(body)}); }
+    function ajaxPost(action, params) {
+        var p = Object.assign({action: action, nonce: SHPK_NONCE}, params);
+        return fetch(AJAX_URL, {method:'POST', body: new URLSearchParams(p)}).then(function(r){ return r.json(); });
+    }
+
+    function shpkNextThursday() {
+        var d = new Date();
+        var dow = d.getDay();
+        var delta = (4 - dow + 7) % 7;
+        if (delta === 0) delta = 7;
+        d.setDate(d.getDate() + delta);
+        return d.toISOString().slice(0, 10);
+    }
+    function shpkFormatHebrew(iso) {
+        if (!iso) return '';
+        var d = new Date(iso + 'T12:00:00');
+        var names = ['ראשון','שני','שלישי','רביעי','חמישי','שישי','שבת'];
+        return 'יום ' + names[d.getDay()] + ' ' + d.getDate() + '.' + (d.getMonth() + 1);
+    }
+    window.shpkUpdateDatePreview = function() {
+        var val = document.getElementById('shpk-ship-date').value;
+        document.getElementById('shpk-date-preview').textContent = shpkFormatHebrew(val);
+    };
+    function shpkLoadShipping() {
+        ajaxPost('shpk_get_shipping', {}).then(function(d) {
+            if (!d.success) return;
+            if (d.data.widget_id) shippingWidgetId = d.data.widget_id;
+            var today = new Date().toISOString().slice(0, 10);
+            var iso = (d.data.date && d.data.date > today) ? d.data.date : shpkNextThursday();
+            document.getElementById('shpk-ship-date').value = iso;
+            shpkUpdateDatePreview();
+            if (d.data.extra) document.getElementById('shpk-ship-extra').value = d.data.extra;
+        });
+    }
+    function shpkMakeBanner(isoDate, extra) {
+        var extraHtml = extra ? '<br><span style="font-size:.85rem;opacity:.85">' + extra + '</span>' : '';
+        var js = "(function(){" +
+            "if(sessionStorage.getItem('sk_sb'))return;" +
+            "var b=document.getElementById('sk-ship-bar');if(!b)return;" +
+            "var override=b.getAttribute('data-date');" +
+            "var today=new Date().toISOString().slice(0,10);" +
+            "var d=new Date();" +
+            "if(override&&override>today){" +
+            "d=new Date(override+'T12:00:00');" +
+            "}else{" +
+            "var delta=(4-d.getDay()+7)%7;" +
+            "if(delta===0)delta=7;" +
+            "d.setDate(d.getDate()+delta);" +
+            "}" +
+            "var nm=['ראשון','שני','שלישי','רביעי','חמישי','שישי','שבת'];" +
+            "var s=b.querySelector('.sk-ship-date');" +
+            "if(s)s.textContent='יום '+nm[d.getDay()]+' '+d.getDate()+'.'+(d.getMonth()+1);" +
+            "b.style.display='block';" +
+            "document.body.prepend?document.body.prepend(b):document.body.insertBefore(b,document.body.firstChild);" +
+            "})();";
+        return '<!-- wp:html -->\n' +
+            '<div id="sk-ship-bar" data-date="' + (isoDate || '') + '" style="display:none;background:#2d5a27;color:#fff;padding:.9rem 8rem .9rem 1.5rem;text-align:center;font-family:Rubik,sans-serif;font-size:1.05rem;position:relative;z-index:99999;box-shadow:0 2px 8px rgba(0,0,0,.25);line-height:1.5">\n' +
+            '  &#x1F4E6; <strong>המשלוח הבא: <span class="sk-ship-date"></span></strong>&nbsp;&nbsp;|&nbsp;&nbsp;&#x1F69A; משלוח רק 10&#8362;&nbsp;&nbsp;|&nbsp;&nbsp;חינם מהזמנה מעל 380&#8362;' + extraHtml + '\n' +
+            '  <button onclick="document.getElementById(\'sk-ship-bar\').style.display=\'none\';sessionStorage.setItem(\'sk_sb\',\'1\')" style="position:absolute;left:.75rem;top:50%;transform:translateY(-50%);background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.4);border-radius:6px;color:#fff;font-size:.85rem;font-family:Rubik,sans-serif;padding:.3rem .7rem;cursor:pointer;font-weight:600;white-space:nowrap" aria-label="סגור">הבנתי &#x2713;</button>\n' +
+            '</div>\n' +
+            '<scr' + 'ipt>\n' + js + '\n</sc' + 'ript>\n' +
+            '<!-- /wp:html -->';
+    }
+    window.shpkUpdateShipping = async function() {
+        var iso   = document.getElementById('shpk-ship-date').value;
+        var extra = document.getElementById('shpk-ship-extra').value.trim();
+        var st    = document.getElementById('shpk-ship-status');
+        if (!iso) { st.textContent = 'יש לבחור תאריך משלוח'; st.style.color = '#c62828'; return; }
+        var hebrewDate = shpkFormatHebrew(iso);
+        st.textContent = 'מעדכן...'; st.style.color = '#888';
+        try {
+            var saved = await ajaxPost('shpk_save_shipping', {date: iso, extra: extra});
+            if (!saved.success) throw new Error('שגיאה בשמירה');
+            var wr = await wpPut('/widgets/' + shippingWidgetId,
+                {sidebar: 'footer1', instance: {raw: {content: shpkMakeBanner(iso, extra)}}});
+            var wd = await wr.json();
+            if (wd.code) throw new Error(wd.message || 'widget error');
+            st.textContent = '✓ הבאנר עודכן — ' + hebrewDate; st.style.color = '#2d5a27';
+            setTimeout(function(){ st.textContent = ''; }, 6000);
+        } catch(e) {
+            st.textContent = '✗ ' + e.message; st.style.color = '#c62828';
+        }
+    };
+
+    shpkLoadShipping();
+    })();
+    </script>
+    <?php
+    echo '</div>';
+}
+
+/* ── ייצוא הזמנות נארזות — נגיש לקופאי (PIN) מכל עמוד, בלי צורך
+   בהתחברות ל-wp-admin (לכן wp_loaded ולא admin_init). קובץ נפרד לכל
+   לקוח בתוך ZIP אחד; פורמט כל CSV תואם ל"ייבוא פריטים למסמך → קובץ
+   פשוט" של הקופה: מספר מסמך (מספר הזמנה בווקומרס), ברקוד, כמות, מחיר. ── */
 add_action('wp_loaded', function () {
     if (($_GET['shpk_export'] ?? '') !== 'packed') return;
     $pin    = get_option('shushka_pick_pin', '1234');
     $pin_ok = isset($_COOKIE['shushka_pin']) && $_COOKIE['shushka_pin'] === md5($pin . AUTH_KEY);
     if (!$pin_ok && !current_user_can('manage_woocommerce')) wp_die('אין הרשאה');
+
     $orders = wc_get_orders(['status' => ['packed'], 'limit' => -1, 'orderby' => 'date', 'order' => 'ASC']);
-    header('Content-Type: text/csv; charset=utf-8');
-    header('Content-Disposition: attachment; filename="shushka-packed-' . date('Ymd-His') . '.csv"');
-    header('Pragma: no-cache');
-    $out = fopen('php://output', 'w');
-    fputs($out, "\xEF\xBB\xBF");
-    fputcsv($out, ['מספר הזמנה', 'שם לקוח', 'ברקוד', 'שם מוצר', 'כמות', 'מחיר ליחידה', 'סה"כ שורה']);
-    $seq = 0;
+    if (!$orders) wp_die('אין הזמנות בסטטוס "נארז" לייצוא.');
+
+    // קיבוץ לפי לקוח — טלפון כמזהה יציב (כמו בקופה), שם כגיבוי כשאין טלפון.
+    $groups = [];
     foreach ($orders as $order) {
-        $seq++;
+        $phone = preg_replace('/\D+/', '', (string) $order->get_billing_phone());
         $cname = trim($order->get_billing_first_name() . ' ' . $order->get_billing_last_name());
-        foreach ($order->get_items() as $item) {
-            $product    = $item->get_product();
-            $sku        = $product ? $product->get_sku() : '';
-            $qty        = $item->get_quantity();
-            $unit_price = $qty > 0 ? round($item->get_total() / $qty, 2) : 0;
-            fputcsv($out, [$seq, $cname, $sku, $item->get_name(), $qty,
-                           number_format((float)$unit_price, 2, '.', ''),
-                           number_format((float)$item->get_total(), 2, '.', '')]);
-        }
+        $key   = $phone !== '' ? 'phone_' . $phone : 'name_' . $cname;
+        if (!isset($groups[$key])) $groups[$key] = ['name' => $cname ?: 'לקוח', 'orders' => []];
+        $groups[$key]['orders'][] = $order;
     }
-    fclose($out);
+
+    $tmp_zip = wp_tempnam('shushka-packed.zip');
+    $zip = new ZipArchive();
+    if ($zip->open($tmp_zip, ZipArchive::OVERWRITE) !== true) wp_die('שגיאה ביצירת קובץ ZIP');
+
+    $used_names = [];
+    foreach ($groups as $group) {
+        $order_ids = array_map(fn($o) => $o->get_id(), $group['orders']);
+
+        // בנייה ידנית של השורות (לא fputcsv) כדי לשלוט במדויק בפורמט: בלי BOM
+        // (קובץ הזה נקרא ע"י הקופה, לא נפתח ב-Excel ע"י בן-אדם) ועם \r\n מפורש
+        // בין שורות — פרסרים ישנים של תוכנות קופה על Windows לפעמים לא מזהים
+        // \n בודד כסוף שורה ומחזירים "0 פריטים נמצאו" בלי שגיאה ברורה.
+        $lines = [];
+        foreach ($group['orders'] as $order) {
+            $doc_num = $order->get_id();
+            foreach ($order->get_items() as $item) {
+                $product    = $item->get_product();
+                $sku        = $product ? $product->get_sku() : '';
+                $qty        = $item->get_quantity();
+                $unit_price = $qty > 0 ? round($item->get_total() / $qty, 2) : 0;
+                $lines[] = $doc_num . ',' . $sku . ',' . $qty . ',' . number_format((float) $unit_price, 2, '.', '');
+            }
+        }
+        $content = implode("\r\n", $lines) . "\r\n";
+
+        $safe_name = preg_replace('/[\\\\\/:*?"<>|]+/u', '', $group['name']);
+        $safe_name = trim(preg_replace('/\s+/u', '_', $safe_name));
+        if ($safe_name === '') $safe_name = 'לקוח';
+
+        $filename = $safe_name . '_' . implode('-', $order_ids) . '.csv';
+        $i = 2;
+        while (isset($used_names[$filename])) {
+            $filename = $safe_name . '_' . implode('-', $order_ids) . '_' . $i . '.csv';
+            $i++;
+        }
+        $used_names[$filename] = true;
+
+        $zip->addFromString($filename, $content);
+    }
+    $zip->close();
+
+    header('Content-Type: application/zip');
+    header('Content-Disposition: attachment; filename="shushka-packed-' . date('Ymd-His') . '.zip"');
+    header('Pragma: no-cache');
+    header('Content-Length: ' . filesize($tmp_zip));
+    readfile($tmp_zip);
+    @unlink($tmp_zip);
     exit;
 });
 
@@ -270,75 +452,8 @@ add_action('admin_init', function() {
         exit;
     }
 
-    // ייצוא הזמנות נארזות — קובץ נפרד לכל לקוח, בתוך ZIP אחד.
-    // פורמט כל קובץ CSV תואם ל"ייבוא פריטים למסמך → קובץ פשוט" של הקופה:
-    // מספר מסמך (מספר הזמנה בווקומרס), ברקוד/קוד פריט, כמות, מחיר ליחידה.
-    if ($action === 'export_packed') {
-        $pin    = get_option('shushka_pick_pin', '1234');
-        $pin_ok = isset($_COOKIE['shushka_pin']) && $_COOKIE['shushka_pin'] === md5($pin . AUTH_KEY);
-        if (!$pin_ok && !current_user_can('manage_woocommerce')) wp_die('אין הרשאה');
-
-        $orders = wc_get_orders(['status' => ['packed'], 'limit' => -1, 'orderby' => 'date', 'order' => 'ASC']);
-        if (!$orders) wp_die('אין הזמנות בסטטוס "נארז" לייצוא.');
-
-        // קיבוץ לפי לקוח — טלפון כמזהה יציב (כמו בקופה), שם כגיבוי כשאין טלפון.
-        $groups = [];
-        foreach ($orders as $order) {
-            $phone = preg_replace('/\D+/', '', (string) $order->get_billing_phone());
-            $cname = trim($order->get_billing_first_name() . ' ' . $order->get_billing_last_name());
-            $key   = $phone !== '' ? 'phone_' . $phone : 'name_' . $cname;
-            if (!isset($groups[$key])) $groups[$key] = ['name' => $cname ?: 'לקוח', 'orders' => []];
-            $groups[$key]['orders'][] = $order;
-        }
-
-        $tmp_zip = wp_tempnam('shushka-packed.zip');
-        $zip = new ZipArchive();
-        if ($zip->open($tmp_zip, ZipArchive::OVERWRITE) !== true) wp_die('שגיאה ביצירת קובץ ZIP');
-
-        $used_names = [];
-        foreach ($groups as $group) {
-            $order_ids = array_map(fn($o) => $o->get_id(), $group['orders']);
-
-            $csv = fopen('php://temp', 'w+');
-            fputs($csv, "\xEF\xBB\xBF");
-            foreach ($group['orders'] as $order) {
-                $doc_num = $order->get_id();
-                foreach ($order->get_items() as $item) {
-                    $product    = $item->get_product();
-                    $sku        = $product ? $product->get_sku() : '';
-                    $qty        = $item->get_quantity();
-                    $unit_price = $qty > 0 ? round($item->get_total() / $qty, 2) : 0;
-                    fputcsv($csv, [$doc_num, $sku, $qty, number_format((float) $unit_price, 2, '.', '')]);
-                }
-            }
-            rewind($csv);
-            $content = stream_get_contents($csv);
-            fclose($csv);
-
-            $safe_name = preg_replace('/[\\\\\/:*?"<>|]+/u', '', $group['name']);
-            $safe_name = trim(preg_replace('/\s+/u', '_', $safe_name));
-            if ($safe_name === '') $safe_name = 'לקוח';
-
-            $filename = $safe_name . '_' . implode('-', $order_ids) . '.csv';
-            $i = 2;
-            while (isset($used_names[$filename])) {
-                $filename = $safe_name . '_' . implode('-', $order_ids) . '_' . $i . '.csv';
-                $i++;
-            }
-            $used_names[$filename] = true;
-
-            $zip->addFromString($filename, $content);
-        }
-        $zip->close();
-
-        header('Content-Type: application/zip');
-        header('Content-Disposition: attachment; filename="shushka-packed-' . date('Ymd-His') . '.zip"');
-        header('Pragma: no-cache');
-        header('Content-Length: ' . filesize($tmp_zip));
-        readfile($tmp_zip);
-        @unlink($tmp_zip);
-        exit;
-    }
+    // "ייצוא הזמנות נארזות" מטופל ב-wp_loaded (shpk_export=packed) — נגיש גם
+    // ללא התחברות ל-wp-admin (PIN), כדי שדף הליקוט עצמו יוכל לקשר אליו.
 });
 
 /* ── AJAX: הסתרה/שחזור מוצרים בבצ'ים ─────────────────── */
@@ -790,7 +905,7 @@ function shpk_prices_page() {
         echo '<h2 style="margin-top:0">📥 ייצוא הזמנות נארזות לקופה</h2>';
         echo '<p style="color:#555">' . $packed_count . ' הזמנות בסטטוס "נארז" מוכנות לייצוא. '
             . 'הקובץ יורד כ-ZIP עם קובץ CSV נפרד לכל לקוח (שם הקובץ כולל את שם הלקוח ומספרי ההזמנות).</p>';
-        echo '<a href="' . $base . '&action=export_packed" class="button button-primary button-large">⬇ הורד ZIP</a>';
+        echo '<a href="' . esc_url(add_query_arg('shpk_export', 'packed', home_url('/'))) . '" class="button button-primary button-large">⬇ הורד ZIP</a>';
         echo '</div>';
 
         // Section 2: import
@@ -1273,12 +1388,14 @@ function shpk_pick_page($frontend = false) {
             $cname=trim($ord->get_billing_first_name().' '.$ord->get_billing_last_name());
             $city=$ord->get_shipping_city()?:$ord->get_billing_city();
             $phone=$ord->get_billing_phone();
+            $is_pickup=shpk_order_is_pickup($ord);
         ?>
         <div class="oc <?php echo esc_attr($st); ?>" id="oc-<?php echo $oid; ?>">
             <div class="oc-hd">
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                     <span class="oc-title">#<?php echo $onum; ?><?php if($cname) echo ' — '.esc_html($cname); ?></span>
-                    <?php if($city): ?><span class="oc-city"><?php echo esc_html($city); ?></span><?php endif; ?>
+                    <?php if($is_pickup): ?><span class="oc-city" style="background:#8a5a00">🏠 איסוף עצמי</span>
+                    <?php elseif($city): ?><span class="oc-city">🚚 <?php echo esc_html($city); ?></span><?php endif; ?>
                     <?php if($phone): ?><a class="oc-phone no-print" href="tel:<?php echo esc_attr($phone); ?>">📞 <?php echo esc_html($phone); ?></a><?php endif; ?>
                 </div>
                 <div class="hd-actions no-print">
@@ -1497,11 +1614,22 @@ function shpk_pick_page($frontend = false) {
 }
 
 /* ── דף השליח ────────────────────────────────────────── */
+/* ── האם ההזמנה היא איסוף עצמי (ולא משלוח)? לפי שיטת המשלוח שנבחרה
+   בצ'ק-אאוט בפועל, לא לפי עיר/כתובת — כך שאיסוף עצמי לא מופיע בדף
+   השליח, ללא תלות באם הלקוח גר בתוך אזור המשלוח או לא. ── */
+function shpk_order_is_pickup($order) {
+    foreach ($order->get_shipping_methods() as $sm) {
+        if (strpos($sm->get_method_id(), 'local_pickup') !== false) return true;
+    }
+    return false;
+}
+
 function shpk_deliver_page($frontend = false) {
     if (!shpk_check_pin()) { shpk_pin_form('כניסה לדף השליח'); return; }
     $ajax_url = admin_url('admin-ajax.php');
     $nonce  = wp_create_nonce('shushka_nonce');
     $orders = wc_get_orders(array('status' => array('packed'),'limit' => -1,'orderby' => 'date','order' => 'ASC'));
+    $orders = array_values(array_filter($orders, fn($o) => !shpk_order_is_pickup($o)));
     usort($orders, function($a,$b){
         return strcmp($a->get_shipping_city()?:$a->get_billing_city(), $b->get_shipping_city()?:$b->get_billing_city());
     });
@@ -1510,10 +1638,10 @@ function shpk_deliver_page($frontend = false) {
     ?>
     <div class="sp" dir="rtl">
         <h1>🚚 דף השליח — <?php echo $ds; ?></h1>
-        <p class="meta no-print"><?php echo $total; ?> הזמנות נארזות, ממוינות לפי עיר</p>
+        <p class="meta no-print"><?php echo $total; ?> הזמנות נארזות למשלוח, ממוינות לפי עיר (איסוף עצמי לא מוצג כאן)</p>
         <button class="pbtn no-print" onclick="window.print()" style="margin-bottom:14px">🖨️ הדפס</button>
         <?php if(!$total): ?>
-        <p>אין הזמנות נארזות. סמן הזמנות כ"נארז" בדף הליקוט.</p>
+        <p>אין הזמנות נארזות למשלוח. סמן הזמנות כ"נארז" בדף הליקוט.</p>
         <?php else: ?>
         <table class="dt" id="dtbl">
             <thead><tr>
@@ -1899,14 +2027,6 @@ function shpk_products_page() {
 #shpk-products .hdr-links{margin-right:auto;display:flex;gap:1rem;align-items:center}
 #shpk-products .hdr-links a{color:#b8e0b5;font-size:.8rem;text-decoration:none}
 #shpk-products .hdr-links a:hover{color:#fff}
-#shpk-products .ship-section{background:#fffde7;border-bottom:2px solid #ffe082;padding:.7rem 1.5rem;display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
-#shpk-products .ship-section label{font-weight:600;font-size:.85rem;white-space:nowrap;color:#5a4800}
-#shpk-products .ship-section input[type=text]{border:1px solid #ccc;border-radius:6px;padding:.38rem .65rem;font-family:'Rubik',sans-serif;font-size:.85rem}
-#shpk-products .ship-section input:focus{outline:none;border-color:#2d5a27}
-#shpk-products .btn-ship{background:#2d5a27;color:#fff;border:none;border-radius:6px;padding:.4rem 1rem;cursor:pointer;font-family:'Rubik',sans-serif;font-weight:600;font-size:.83rem;white-space:nowrap}
-#shpk-products .btn-ship:hover{background:#245020}
-#shpk-products .ship-status{font-size:.82rem;min-width:160px}
-#shpk-products .ship-hint{font-size:.75rem;color:#a08030;margin-right:auto}
 #shpk-products .filters{background:#fff;padding:.7rem 1.5rem;border-bottom:1px solid #e8e3dc;display:flex;gap:.55rem;align-items:center;flex-wrap:wrap}
 #shpk-products .filters select,#shpk-products .filters input[type=text]{border:1px solid #d0cbc4;border-radius:6px;padding:.38rem .6rem;font-family:'Rubik',sans-serif;font-size:.84rem;background:#fff}
 #shpk-products .filters select:focus,#shpk-products .filters input:focus{outline:none;border-color:#2d5a27}
@@ -1922,33 +2042,57 @@ function shpk_products_page() {
 #shpk-products tbody tr:last-child td{border-bottom:none}
 #shpk-products tbody tr:hover td{background:#faf7f3}
 #shpk-products tbody tr.modified td{background:#fff9e6}
+#shpk-products tbody tr.saving td{background:#fff9c4}
 #shpk-products tbody tr.saved td{background:#f0faf0}
 #shpk-products tbody tr.err td{background:#fff0f0}
 #shpk-products .num{color:#aaa;font-size:.75rem;text-align:center}
 #shpk-products .inp-name{border:1px solid #d8d0c8;border-radius:5px;padding:.32rem .5rem;font-family:'Rubik',sans-serif;font-size:.84rem;width:100%;min-width:180px;background:#fafaf8;transition:.15s;color:#2b2b2b}
 #shpk-products .inp-name:hover{border-color:#aaa;background:#fff}
 #shpk-products .inp-name:focus{border-color:#2d5a27;background:#fff;outline:none;box-shadow:0 0 0 2px rgba(45,90,39,.12)}
-#shpk-products .inp-brand,#shpk-products .inp-tags{border:1px solid #d8d0c8;border-radius:5px;padding:.32rem .5rem;font-family:'Rubik',sans-serif;font-size:.84rem;width:100%;background:#fafaf8;transition:.15s;color:#2b2b2b}
-#shpk-products .inp-brand:focus,#shpk-products .inp-tags:focus{border-color:#2d5a27;background:#fff;outline:none}
+#shpk-products .inp-brand{border:1px solid #d8d0c8;border-radius:5px;padding:.32rem .5rem;font-family:'Rubik',sans-serif;font-size:.84rem;width:100%;background:#fafaf8;transition:.15s;color:#2b2b2b}
+#shpk-products .inp-brand:focus{border-color:#2d5a27;background:#fff;outline:none}
+#shpk-products .tm-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:1000;align-items:center;justify-content:center}
+#shpk-products .tm-overlay.show{display:flex}
+#shpk-products .tm-box{background:#fff;border-radius:10px;width:90%;max-width:420px;max-height:80vh;display:flex;flex-direction:column;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+#shpk-products .tm-head{padding:1rem 1.2rem .6rem;border-bottom:1px solid #eee}
+#shpk-products .tm-head h3{margin:0 0 .5rem;font-size:1.05rem}
+#shpk-products .tm-selected{display:flex;flex-wrap:wrap;gap:.3rem;margin-bottom:.5rem;max-height:90px;overflow-y:auto}
+#shpk-products .tm-chip{display:inline-flex;align-items:center;gap:.3rem;background:#eef3ec;border:1px solid #cfe0cb;border-radius:14px;padding:.25rem .3rem .25rem .6rem;font-size:.8rem}
+#shpk-products .tm-chip button{background:none;border:none;color:#777;font-size:.8rem;cursor:pointer;padding:0 .2rem}
+#shpk-products .tm-search{width:100%;box-sizing:border-box;font-size:1rem;padding:.5rem .7rem;border:1px solid #ccc;border-radius:6px;font-family:'Rubik',sans-serif}
+#shpk-products .tm-list{flex:1;overflow-y:auto;padding:.3rem 1.2rem}
+#shpk-products .tm-row{display:block;padding:.4rem 0;font-size:.9rem;cursor:pointer}
+#shpk-products .tm-row input{margin-left:.5rem}
+#shpk-products .tm-row-new{color:#183625;font-weight:600}
+#shpk-products .tm-hint{color:#999;font-size:.85rem;padding:.6rem 0}
+#shpk-products .tm-foot{padding:.8rem 1.2rem;border-top:1px solid #eee;display:flex;gap:.5rem;justify-content:flex-end}
+#shpk-products .tm-foot button{padding:.5rem 1.2rem;border-radius:6px;border:none;cursor:pointer;font-family:'Rubik',sans-serif;font-weight:600}
+#shpk-products .tm-cancel{background:#eee;color:#555}
+#shpk-products .tm-save{background:#2d5a27;color:#fff}
 #shpk-products .td-brand{white-space:nowrap}
-#shpk-products .td-brand input{width:calc(100% - 30px);display:inline-block}
+#shpk-products .td-brand input{width:calc(100% - 28px);display:inline-block}
 #shpk-products .btn-suggest{background:none;border:none;cursor:pointer;font-size:1rem;padding:0 2px;vertical-align:middle;opacity:.7}
 #shpk-products .btn-suggest:hover{opacity:1}
 #shpk-products .sku{color:#aaa;font-size:.76rem;font-family:monospace;white-space:nowrap}
 #shpk-products select.sel{border:1px solid #ddd;border-radius:5px;padding:.3rem .45rem;font-family:'Rubik',sans-serif;font-size:.8rem;width:100%;min-width:120px;background:#fff;cursor:pointer}
 #shpk-products select.sel:focus{border-color:#2d5a27;outline:none}
-#shpk-products .btn-save{background:#e8f5e9;color:#2d5a27;border:1px solid #a5d6a7;border-radius:5px;padding:.3rem .8rem;cursor:pointer;font-family:'Rubik',sans-serif;font-size:.8rem;font-weight:600;transition:.15s;white-space:nowrap}
-#shpk-products .btn-save:hover{background:#2d5a27;color:#fff;border-color:#2d5a27}
-#shpk-products .btn-save.saving{background:#fff9c4;color:#e65100;border-color:#ffd54f;cursor:wait}
-#shpk-products .btn-save.ok{background:#c8e6c9;color:#1b5e20;border-color:#66bb6a}
-#shpk-products .btn-save.fail{background:#ffcdd2;color:#b71c1c;border-color:#ef9a9a}
 #shpk-products .act-btns{display:flex;flex-direction:column;gap:.28rem}
-#shpk-products .btn-vis{background:#e3f2fd;color:#1565c0;border:1px solid #90caf9;border-radius:5px;padding:.3rem .8rem;cursor:pointer;font-family:'Rubik',sans-serif;font-size:.8rem;font-weight:600;transition:.15s;white-space:nowrap}
-#shpk-products .btn-vis:hover{background:#1565c0;color:#fff;border-color:#1565c0}
-#shpk-products .btn-vis:disabled{opacity:.5;cursor:wait}
-#shpk-products .btn-del{background:#ffebee;color:#c62828;border:1px solid #ef9a9a;border-radius:5px;padding:.3rem .8rem;cursor:pointer;font-family:'Rubik',sans-serif;font-size:.8rem;font-weight:600;transition:.15s;white-space:nowrap}
-#shpk-products .btn-del:hover{background:#c62828;color:#fff;border-color:#c62828}
-#shpk-products .btn-del:disabled{opacity:.5;cursor:wait}
+#shpk-products .pill{border:1px solid transparent;border-radius:6px;padding:.28rem .5rem;cursor:pointer;font-family:'Rubik',sans-serif;font-size:.76rem;font-weight:600;white-space:nowrap;width:100%;text-align:center}
+#shpk-products .pill-ok{background:#e8f5e9;color:#2d5a27;border-color:#a5d6a7}
+#shpk-products .pill-bad{background:#ffebee;color:#c62828;border-color:#ef9a9a}
+#shpk-products .pill-off{background:#f5f5f5;color:#999;border-color:#e0e0e0}
+#shpk-products .pill-off:hover{background:#ececec;color:#666}
+#shpk-products .pill:disabled{opacity:.5;cursor:wait}
+#shpk-products .pill-group{display:flex;flex-direction:column;gap:.25rem}
+#shpk-products table.hide-contents .contents-col{display:none}
+#shpk-products .tags-display{display:flex;align-items:center;gap:.3rem;min-height:1.6em}
+#shpk-products .tags-display span{font-size:.82rem;color:#555;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:140px}
+#shpk-products .btn-edit-tags{background:none;border:1px solid #d8d0c8;border-radius:5px;padding:.2rem .4rem;cursor:pointer;font-size:.85rem;flex-shrink:0}
+#shpk-products .inp-price{border:1px solid #d8d0c8;border-radius:5px;padding:.32rem .4rem;font-family:'Rubik',sans-serif;font-size:.84rem;width:100%;background:#fafaf8}
+#shpk-products .inp-price:focus,#shpk-products .inp-contents-qty:focus,#shpk-products .inp-contents-unit:focus{border-color:#2d5a27;background:#fff;outline:none}
+#shpk-products .inp-contents-qty,#shpk-products .inp-contents-unit{border:1px solid #d8d0c8;border-radius:5px;padding:.32rem .5rem;font-family:'Rubik',sans-serif;font-size:.84rem;width:100%;background:#fafaf8}
+#shpk-products .flag-btn{background:none;border:1px solid #ddd;border-radius:5px;padding:.3rem .4rem;cursor:pointer;font-size:.95rem;width:100%}
+#shpk-products .flag-btn.on{background:#fff3e0;border-color:#ffb74d}
 #shpk-products tbody tr.hidden-prod .inp-name{color:#aaa;text-decoration:line-through}
 #shpk-products tbody tr.hidden-prod td{opacity:.6}
 #shpk-products .pager{display:flex;gap:.4rem;padding:.9rem 1.5rem;justify-content:center;align-items:center;flex-wrap:wrap}
@@ -1964,11 +2108,6 @@ function shpk_products_page() {
 #shpk-products{margin:-10px -12px 0}
 #shpk-products .hdr{flex-wrap:wrap;padding:.7rem 1rem;gap:.5rem}
 #shpk-products .hdr-links{margin-right:0}
-#shpk-products .ship-section{flex-direction:column;align-items:stretch;gap:.5rem;padding:.8rem 1rem}
-#shpk-products .ship-section input[type=text]{width:100%!important;font-size:1rem;padding:.55rem .8rem}
-#shpk-products .btn-ship{width:100%;padding:.65rem;font-size:.95rem}
-#shpk-products .ship-hint{margin-right:0}
-#shpk-products .ship-status{min-width:0}
 #shpk-products .filters{flex-direction:column;gap:.5rem;padding:.8rem 1rem}
 #shpk-products .filters select,#shpk-products .filters input[type=text]{width:100%!important;font-size:1rem;padding:.55rem .8rem}
 #shpk-products .btn{width:100%;padding:.65rem;font-size:.95rem}
@@ -1987,7 +2126,7 @@ function shpk_products_page() {
 #shpk-products .inp-name{min-width:0;font-size:1rem;padding:.55rem .7rem}
 #shpk-products .sku{display:block;padding-bottom:.2rem}
 #shpk-products select.sel{min-width:0;width:100%;font-size:.97rem;padding:.48rem .6rem}
-#shpk-products .btn-save,#shpk-products .btn-vis,#shpk-products .btn-del{width:100%;padding:.6rem;font-size:.95rem}
+#shpk-products .pill{width:100%;padding:.6rem;font-size:.95rem}
 #shpk-products .act-btns{margin-top:.35rem;gap:.4rem}
 #shpk-products .pager{padding:.7rem .5rem;gap:.3rem}
 #shpk-products .pager button{min-width:42px;padding:.45rem .7rem;font-size:.92rem}
@@ -2008,16 +2147,6 @@ function shpk_products_page() {
   </div>
 </div>
 
-<div class="ship-section">
-  <label>📦 באנר משלוח:</label>
-  <input id="shpk-ship-date" type="date" style="width:160px" onchange="shpkUpdateDatePreview()">
-  <span id="shpk-date-preview" style="font-size:.85rem;color:#7a6200;font-style:italic"></span>
-  <input id="shpk-ship-extra" type="text" placeholder="הערה נוספת (אופציונלי)" style="width:240px">
-  <button class="btn-ship" onclick="shpkUpdateShipping()">עדכן באנר בחנות ↑</button>
-  <span class="ship-status" id="shpk-ship-status"></span>
-  <span class="ship-hint">לבדיקה: פתח חלון גלישה פרטי</span>
-</div>
-
 <div class="filters">
   <select id="shpk-f-cat" onchange="shpkOnParentChange()"><option value="">כל הקטגוריות</option></select>
   <select id="shpk-f-sub"><option value="">כל תת-הקטגוריות</option></select>
@@ -2025,22 +2154,49 @@ function shpk_products_page() {
     onkeydown="if(event.key==='Enter')shpkLoad(1)">
   <button class="btn btn-green"    onclick="shpkLoad(1)">🔍 חפש</button>
   <button class="btn btn-gray"     onclick="shpkClearFilters()">נקה</button>
+  <label style="font-size:.83rem;color:#555;display:flex;align-items:center;gap:.3rem;white-space:nowrap">
+    <input type="checkbox" id="shpk-show-contents" checked onchange="shpkToggleContentsCols()"> הצג עמודת תכולה
+  </label>
   <button class="btn btn-save-all" id="shpk-btn-save-all" onclick="shpkSaveAll()" style="display:none">✔ שמור הכל</button>
 </div>
 <div class="stats" id="shpk-stats">–</div>
 
+<datalist id="shpk-brands-list"></datalist>
+<datalist id="shpk-units-list">
+  <option value="גרם"><option value="קילוגרם"><option value="מ״ל"><option value="ליטר">
+  <option value="יחידות"><option value="קפסולות"><option value="חבילה"><option value="שקית">
+</datalist>
+<div id="shpk-tag-modal" class="tm-overlay">
+  <div class="tm-box">
+    <div class="tm-head">
+      <h3>🏷️ עריכת תגיות</h3>
+      <div id="shpk-tag-modal-selected" class="tm-selected"></div>
+      <input id="shpk-tag-modal-search" type="text" class="tm-search" placeholder="הקלידו לחיפוש תגית..." oninput="shpkTagModalSearchInput()">
+    </div>
+    <div id="shpk-tag-modal-list" class="tm-list"></div>
+    <div class="tm-foot">
+      <button class="tm-cancel" onclick="shpkCloseTagPicker()">ביטול</button>
+      <button class="tm-save" onclick="shpkApplyTagPicker()">✔ עדכן תגיות</button>
+    </div>
+  </div>
+</div>
 <div class="tbl-wrap">
   <div class="loading-msg" id="shpk-loading">⏳ טוען מוצרים...</div>
   <table id="shpk-tbl" style="display:none">
     <thead><tr>
       <th style="width:38px">#</th>
       <th style="min-width:200px">✏ שם מוצר</th>
-      <th style="width:85px">SKU</th>
       <th style="min-width:130px">קטגוריה</th>
       <th style="min-width:130px">תת-קטגוריה</th>
       <th style="min-width:110px">מותג</th>
       <th style="min-width:160px">תגיות</th>
-      <th style="width:100px"></th>
+      <th style="width:85px">מחיר (₪)</th>
+      <th class="contents-col" style="width:85px">כמות</th>
+      <th class="contents-col" style="width:100px">יחידה</th>
+      <th style="width:85px">SKU</th>
+      <th style="width:90px">מלאי</th>
+      <th style="width:120px">מכירה</th>
+      <th style="width:60px">תמונה</th>
     </tr></thead>
     <tbody id="shpk-tbody"></tbody>
   </table>
@@ -2058,14 +2214,12 @@ var WP_NONCE   = '<?php echo esc_js($nonce); ?>';
 var SHPK_NONCE = '<?php echo esc_js($shpk_nonce); ?>';
 var AJAX_URL   = '<?php echo esc_url($ajax_url); ?>';
 
-var cats = [], parents = [], children = {};
+var cats = [], parents = [], children = {}, brands = [], allTags = [];
 var totalPages = 1, modified = new Set();
-var shippingWidgetId = 'block-26';
 
 function apiHdrs() { return {'X-WP-Nonce': WP_NONCE, 'Content-Type': 'application/json'}; }
 function wcGet(path)       { return fetch(WC_REST + path, {headers: apiHdrs()}); }
 function wcPut(path, body) { return fetch(WC_REST + path, {method:'PUT',    headers: apiHdrs(), body: JSON.stringify(body)}); }
-function wcDel(path)       { return fetch(WC_REST + path, {method:'DELETE', headers: apiHdrs()}); }
 function wpPut(path, body) { return fetch(WP_REST + path, {method:'PUT',    headers: apiHdrs(), body: JSON.stringify(body)}); }
 function ajaxPost(action, params) {
     var p = Object.assign({action: action, nonce: SHPK_NONCE}, params);
@@ -2088,8 +2242,130 @@ async function shpkInit() {
     });
     var sel = document.getElementById('shpk-f-cat');
     parents.forEach(function(c){ sel.add(new Option(c.name + ' (' + c.count + ')', c.id)); });
+
+    // טעינת כל המותגים (product_brand האמיתי) — נדרש כדי לפתור שם→id
+    // בשמירה: ל-brands (בניגוד ל-tags/categories) אין יצירה-אוטומטית-לפי-שם
+    // דרך שדה המוצר; חובה id קיים, אז יוצרים אותו מראש אם צריך.
+    var ball = [], bpage = 1;
+    while (true) {
+        var br = await wcGet('/products/brands?per_page=100&page=' + bpage + '&orderby=name');
+        var bdata = await br.json();
+        ball = ball.concat(bdata);
+        if (bpage >= parseInt(br.headers.get('X-WP-TotalPages') || 1)) break;
+        bpage++;
+    }
+    brands = ball;
+    var bdl = document.getElementById('shpk-brands-list');
+    bdl.innerHTML = brands.map(function(b){ return '<option value="' + shpkEsc(b.name) + '">'; }).join('');
+
+    // כל התגיות (product_tag) — נטען פעם אחת ונשמר בזיכרון כדי שחלון
+    // "עריכת תגיות" יוכל להציג מיד את כל הרשימה (כמו קטגוריה), ולסנן
+    // תוך כדי הקלדה בצד הלקוח בלי לפנות לשרת בכל הקשה.
+    var tall = [], tpage = 1;
+    while (true) {
+        var tr2 = await wcGet('/products/tags?per_page=100&page=' + tpage + '&orderby=count&order=desc');
+        var tdata = await tr2.json();
+        tall = tall.concat(tdata);
+        if (tpage >= parseInt(tr2.headers.get('X-WP-TotalPages') || 1)) break;
+        tpage++;
+    }
+    allTags = tall;
+
     shpkLoad(1);
-    shpkLoadShipping();
+}
+
+// ── תגיות: חלון בחירה (לא טקסט חופשי) — רשימה עם checkboxes + חיפוש,
+// כמו שביקשת. משתמש חוזר ב-shpk_data_tag_search הקיים (אותו endpoint
+// שדף עדכון המוצרים כבר משתמש בו) — אין handler חדש בצד השרת.
+var tagModalTr = null, tagModalSelected = [], tagModalTimer = null;
+
+window.shpkOpenTagPicker = function(btn) {
+    tagModalTr = btn.closest('tr');
+    tagModalSelected = JSON.parse(tagModalTr.dataset.tagsAll || '[]').slice();
+    document.getElementById('shpk-tag-modal-search').value = '';
+    document.getElementById('shpk-tag-modal').classList.add('show');
+    shpkRenderTagModalSelected();
+    shpkRenderTagModalResults('');
+    document.getElementById('shpk-tag-modal-search').focus();
+};
+window.shpkCloseTagPicker = function() {
+    document.getElementById('shpk-tag-modal').classList.remove('show');
+};
+window.shpkApplyTagPicker = function() {
+    tagModalTr.dataset.tagsAll = JSON.stringify(tagModalSelected);
+    var span = tagModalTr.querySelector('.tags-display span');
+    var names = tagModalSelected.map(function(t){ return t.name; }).join(', ');
+    span.textContent = names || '—';
+    span.title = names;
+    shpkMark(tagModalTr.querySelector('.inp-name'));
+    shpkScheduleAutoSave(tagModalTr);
+    shpkCloseTagPicker();
+};
+function shpkRenderTagModalSelected() {
+    var wrap = document.getElementById('shpk-tag-modal-selected');
+    if (!tagModalSelected.length) { wrap.innerHTML = '<span style="color:#999;font-size:.82rem">אין תגיות נבחרות</span>'; return; }
+    wrap.innerHTML = tagModalSelected.map(function(t, i) {
+        return '<span class="tm-chip">' + shpkEsc(t.name) +
+            (t.id ? '<button type="button" data-i="' + i + '" data-act="ren" title="שנה שם">✏️</button>' : '') +
+            '<button type="button" data-i="' + i + '" data-act="rm" title="הסר">✕</button></span>';
+    }).join('');
+    Array.prototype.forEach.call(wrap.querySelectorAll('button'), function(b) {
+        b.addEventListener('click', function() {
+            var i = +b.getAttribute('data-i');
+            if (b.getAttribute('data-act') === 'rm') {
+                tagModalSelected.splice(i, 1);
+                shpkRenderTagModalSelected();
+            } else {
+                shpkRenameTagInModal(tagModalSelected[i]);
+            }
+        });
+    });
+}
+async function shpkRenameTagInModal(tag) {
+    var newName = prompt('שם חדש לתגית "' + tag.name + '" (ישתנה בכל האתר):', tag.name);
+    if (newName === null) return;
+    newName = newName.trim();
+    if (!newName || newName === tag.name) return;
+    var d = await ajaxPost('shpk_data_rename_term', {taxonomy: 'product_tag', term_id: tag.id, new_name: newName});
+    if (!d.success) { shpkToast('שגיאה: ' + d.data); return; }
+    tag.name = d.data.name;
+    shpkRenderTagModalSelected();
+    shpkToast('✓ שם התגית עודכן');
+}
+window.shpkTagModalSearchInput = function() {
+    clearTimeout(tagModalTimer);
+    var q = document.getElementById('shpk-tag-modal-search').value.trim();
+    tagModalTimer = setTimeout(function(){ shpkRenderTagModalResults(q); }, 150);
+};
+// סינון בצד הלקוח מתוך allTags (נטען פעם אחת בטעינת הדף) — בדיוק כמו
+// קטגוריה: שדה ריק = כל הרשימה, הקלדה = סינון חי, בלי קריאת שרת בכלל.
+function shpkRenderTagModalResults(q) {
+    var list = document.getElementById('shpk-tag-modal-list');
+    var ql = q.toLowerCase();
+    var matches = q ? allTags.filter(function(t){ return t.name.toLowerCase().indexOf(ql) !== -1; }) : allTags;
+    var rows = matches.slice(0, 300).map(function(t) {
+        var checked = tagModalSelected.some(function(s){ return s.id === t.id; });
+        return '<label class="tm-row"><input type="checkbox" data-id="' + t.id + '" data-name="' + shpkEsc(t.name) + '"' +
+            (checked ? ' checked' : '') + '> ' + shpkEsc(t.name) + ' <span style="color:#aaa">(' + t.count + ')</span></label>';
+    }).join('');
+    var exact = q && matches.some(function(t){ return t.name.toLowerCase() === ql; });
+    if (q && !exact) {
+        rows += '<label class="tm-row tm-row-new"><input type="checkbox" data-id="0" data-name="' + shpkEsc(q) + '"> + תגית חדשה: "' + shpkEsc(q) + '"</label>';
+    }
+    if (matches.length > 300) rows += '<div class="tm-hint">מוצגות 300 התאמות ראשונות — המשיכו להקליד לצמצום</div>';
+    list.innerHTML = rows || '<div class="tm-hint">אין תגיות תואמות</div>';
+    Array.prototype.forEach.call(list.querySelectorAll('input[type=checkbox]'), function(cb) {
+        cb.addEventListener('change', function() {
+            var id = +cb.getAttribute('data-id'), name = cb.getAttribute('data-name');
+            if (cb.checked) {
+                if (!tagModalSelected.some(function(s){ return id ? s.id === id : s.name === name; }))
+                    tagModalSelected.push({id: id, name: name});
+            } else {
+                tagModalSelected = tagModalSelected.filter(function(s){ return id ? s.id !== id : s.name !== name; });
+            }
+            shpkRenderTagModalSelected();
+        });
+    });
 }
 
 window.shpkOnParentChange = function() {
@@ -2136,28 +2412,50 @@ function shpkRender(prods, page) {
         var tr = document.createElement('tr');
         tr.dataset.pid    = p.id;
         tr.dataset.status = p.catalog_visibility || 'visible';
+        tr.dataset.stock  = p.stock_status || 'instock';
+        // attrs: עכשיו רק ל"תכולה" (מקומי, לא טקסונומיה) — מותג עבר לשדה
+        // brands האמיתי (product_brand), לא עוד attribute מקומי מזויף.
         tr.dataset.attrs  = JSON.stringify(p.attributes || []);
         if (p.catalog_visibility === 'hidden') tr.classList.add('hidden-prod');
         var skuRaw = p.sku || '';
         var skuNum = parseFloat(skuRaw);
         var sku = skuRaw && !isNaN(skuNum) ? String(Math.round(skuNum)) : (skuRaw || '–');
-        var visLabel = p.catalog_visibility === 'hidden' ? 'הצג' : 'הסתר';
-        var brandAttr = (p.attributes || []).find(function(a){ return a.name === 'מותג' || a.name.toLowerCase() === 'brand'; });
-        var brandVal  = brandAttr ? ((brandAttr.options || [])[0] || '') : '';
-        var tagsVal   = (p.tags || []).map(function(t){ return t.name; }).join(', ');
+        var stockOk    = (p.stock_status || 'instock') !== 'outofstock';
+        var brandVal   = (p.brands && p.brands[0]) ? p.brands[0].name : '';
+        tr.dataset.brandId = (p.brands && p.brands[0]) ? p.brands[0].id : 0;
+        var tagsVal    = (p.tags || []).map(function(t){ return t.name; }).join(', ');
+        tr.dataset.tagsAll = JSON.stringify(p.tags || []);
+        var contentsAttr = (p.attributes || []).find(function(a){ return a.name === 'תכולה'; });
+        var contentsVal  = contentsAttr ? ((contentsAttr.options || [])[0] || '') : '';
+        // "500 מ״ל" → מספר מוביל + שאר הטקסט כיחידה, בדיוק כמו בדף עדכון
+        // המוצרים — אותה לוגיקת פיצול, כדי ששני הדפים יתנהגו זהה.
+        var cMatch = /^(\d+(?:\.\d+)?)\s*(.*)$/.exec(contentsVal.trim());
+        var qtyVal  = cMatch ? cMatch[1] : '';
+        var unitVal = cMatch ? cMatch[2] : contentsVal;
+        var needsPhoto   = (p.meta_data || []).some(function(m){ return m.key === 'shpk_needs_photo_update' && m.value; });
+        tr.dataset.needsPhoto = needsPhoto ? '1' : '0';
         tr.innerHTML =
             '<td class="num">' + ((page-1)*50+i+1) + '</td>' +
             '<td><input class="inp-name" type="text" value="' + shpkEsc(p.name) + '" oninput="shpkMark(this)"></td>' +
-            '<td class="sku">' + shpkEsc(sku) + '</td>' +
             '<td>' + shpkCatSel(parentId) + '</td>' +
             '<td>' + shpkSubSel(parentId, subId) + '</td>' +
-            '<td class="td-brand"><input class="inp-brand" type="text" value="' + shpkEsc(brandVal) + '" placeholder="מותג" oninput="shpkMark(this)"><button class="btn-suggest" onclick="shpkSuggest(this)" title="הצע AI">💡</button></td>' +
-            '<td><input class="inp-tags" type="text" value="' + shpkEsc(tagsVal) + '" placeholder="תגית1, תגית2" oninput="shpkMark(this)"></td>' +
-            '<td><div class="act-btns">' +
-              '<button class="btn-save" onclick="shpkSave(this)">שמור</button>' +
-              '<button class="btn-vis"  onclick="shpkToggle(this)">' + visLabel + '</button>' +
-              '<button class="btn-del"  onclick="shpkDelete(this)">מחק</button>' +
-            '</div></td>';
+            '<td class="td-brand"><input class="inp-brand" type="text" list="shpk-brands-list" autocomplete="off" value="' + shpkEsc(brandVal) + '" placeholder="מותג" oninput="shpkMark(this)" onfocus="this.select()">' +
+              '<button class="btn-suggest" onclick="shpkRenameBrand(this)" title="שנה שם למותג הנבחר (ישתנה בכל המוצרים שלו)">✏️</button></td>' +
+            '<td><div class="tags-display"><span title="' + shpkEsc(tagsVal) + '">' + shpkEsc(tagsVal || '—') + '</span>' +
+              '<button class="btn-edit-tags" onclick="shpkOpenTagPicker(this)" title="ערוך תגיות">✏️</button></div></td>' +
+            '<td><input class="inp-price" type="number" step="0.1" min="0" value="' + shpkEsc(p.regular_price || '') + '" oninput="shpkMark(this)"></td>' +
+            '<td class="contents-col"><input class="inp-contents-qty" type="number" step="any" min="0" value="' + shpkEsc(qtyVal) + '" placeholder="500" oninput="shpkMark(this)"></td>' +
+            '<td class="contents-col"><input class="inp-contents-unit" type="text" list="shpk-units-list" value="' + shpkEsc(unitVal) + '" placeholder="מ״ל" oninput="shpkMark(this)"></td>' +
+            '<td class="sku">' + shpkEsc(sku) + '</td>' +
+            '<td><div class="pill-group">' +
+              '<button class="pill ' + (stockOk ? 'pill-ok' : 'pill-off') + '" onclick="shpkSetStock(this,\'instock\')">✅ במלאי</button>' +
+              '<button class="pill ' + (!stockOk ? 'pill-bad' : 'pill-off') + '" onclick="shpkSetStock(this,\'outofstock\')">❌ אזל</button>' +
+            '</div></td>' +
+            '<td><div class="pill-group">' +
+              '<button class="pill ' + (p.catalog_visibility !== 'hidden' ? 'pill-ok' : 'pill-off') + '" onclick="shpkSetVisibility(this,\'visible\')">🟢 נמכר</button>' +
+              '<button class="pill ' + (p.catalog_visibility === 'hidden' ? 'pill-bad' : 'pill-off') + '" onclick="shpkSetVisibility(this,\'hidden\')">⚫ הופסק להימכר</button>' +
+            '</div></td>' +
+            '<td><button class="flag-btn' + (needsPhoto ? ' on' : '') + '" onclick="shpkTogglePhotoFlag(this)" title="לסמן שצריך לצלם מחדש">' + (needsPhoto ? '🔧' : '📷') + '</button></td>';
         tbody.appendChild(tr);
         tr.querySelector('select.parent-sel').addEventListener('change', function() {
             var pid2 = +this.value || 0;
@@ -2165,10 +2463,31 @@ function shpkRender(prods, page) {
             sub.innerHTML = '<option value="">— תת-קטגוריה —</option>';
             (children[pid2] || []).forEach(function(c){ sub.add(new Option(c.name, c.id)); });
             shpkMark(this);
+            shpkScheduleAutoSave(tr);
         });
-        tr.querySelector('select.sub-sel').addEventListener('change', function(){ shpkMark(this); });
+        tr.querySelector('select.sub-sel').addEventListener('change', function(){ shpkMark(this); shpkScheduleAutoSave(tr); });
     });
 }
+
+// שמירה אוטומטית: כל שינוי שורה (יציאה משדה טקסט, שינוי select, עדכון
+// תגיות במודל) מתזמן שמירה של אותה שורה בלבד, אחרי השהיה קצרה — כדי
+// שלא תצטרכי ללחוץ "שמור" בכל שורה בנפרד. "שמור הכל" נשאר כגיבוי ידני.
+var autoSaveTimers = {};
+function shpkScheduleAutoSave(tr) {
+    var pid = tr.dataset.pid;
+    clearTimeout(autoSaveTimers[pid]);
+    autoSaveTimers[pid] = setTimeout(function(){
+        if (tr.classList.contains('modified')) shpkSave(tr);
+    }, 900);
+}
+// blur לא עולה (bubble) — צריך delegation בשלב ה-capture כדי לתפוס אותו
+// על כל שדות הטקסט/מספר בכל השורות בלי להירשם אחד-אחד
+document.getElementById('shpk-tbody').addEventListener('blur', function(e) {
+    if (!e.target.matches) return;
+    if (e.target.matches('.inp-name,.inp-brand,.inp-price,.inp-contents-qty,.inp-contents-unit')) {
+        shpkScheduleAutoSave(e.target.closest('tr'));
+    }
+}, true);
 
 function shpkCatSel(selected) {
     var h = '<select class="sel parent-sel"><option value="">— קטגוריה —</option>';
@@ -2181,104 +2500,154 @@ function shpkSubSel(parentId, selected) {
     return h + '</select>';
 }
 
-window.shpkSave = async function(btn) {
-    var tr    = btn.closest('tr');
+// brands (בניגוד ל-tags) לא תומך ביצירה-אוטומטית-לפי-שם דרך שדה המוצר —
+// בדקנו ישירות מול ה-API וזה פשוט לא עושה כלום. חייבים id אמיתי: מוצאים
+// לפי שם (לא תלוי אותיות גדולות/קטנות) ברשימה שבזיכרון, ואם אין — יוצרים
+// term חדש דרך /products/brands ומוסיפים לרשימה המקומית לשימוש הבא.
+async function shpkResolveBrandId(name) {
+    if (!name) return null;
+    var found = brands.find(function(b){ return b.name.toLowerCase() === name.toLowerCase(); });
+    if (found) return found.id;
+    var r = await fetch(WC_REST + '/products/brands', {method: 'POST', headers: apiHdrs(), body: JSON.stringify({name: name})});
+    var d = await r.json();
+    if (d.code) throw new Error(d.message || 'שגיאה ביצירת מותג');
+    brands.push(d);
+    return d.id;
+}
+
+// שמירה פועלת ישירות על השורה (לא על כפתור) — אין יותר "שמור" נפרד לכל
+// שורה מאז שיש שמירה אוטומטית; המשוב הוא צביעת השורה (saving/saved/err).
+window.shpkSave = async function(tr) {
     var pid   = +tr.dataset.pid;
     var name  = tr.querySelector('.inp-name').value.trim();
     var parId = +tr.querySelector('.parent-sel').value || 0;
     var subId = +tr.querySelector('.sub-sel').value   || 0;
     var catId = subId || parId;
-    var tagsStr    = (tr.querySelector('.inp-tags') || {value:''}).value.trim();
-    var tagsList   = tagsStr ? tagsStr.split(',').map(function(t){ return {name: t.trim()}; }).filter(function(t){ return t.name; }) : [];
+    var tagsList   = JSON.parse(tr.dataset.tagsAll || '[]').map(function(t){
+        return t.id ? {id: t.id} : {name: t.name};
+    });
     var brandStr   = (tr.querySelector('.inp-brand') || {value:''}).value.trim();
-    var existAttrs = JSON.parse(tr.dataset.attrs || '[]');
-    var brandIdx   = existAttrs.findIndex(function(a){ return a.name === 'מותג' || a.name.toLowerCase() === 'brand'; });
-    if (brandStr) {
-        if (brandIdx >= 0) existAttrs[brandIdx].options = [brandStr];
-        else existAttrs.push({name: 'מותג', options: [brandStr], visible: true, variation: false});
-    } else if (brandIdx >= 0) {
-        existAttrs.splice(brandIdx, 1);
+    var priceStr   = (tr.querySelector('.inp-price') || {value:''}).value.trim();
+    var qtyStr     = (tr.querySelector('.inp-contents-qty')  || {value:''}).value.trim();
+    var unitStr    = (tr.querySelector('.inp-contents-unit') || {value:''}).value.trim();
+    var contentsStr = (qtyStr + ' ' + unitStr).trim();
+    var existAttrs  = JSON.parse(tr.dataset.attrs || '[]');
+    var contentsIdx = existAttrs.findIndex(function(a){ return a.name === 'תכולה'; });
+    if (contentsStr) {
+        if (contentsIdx >= 0) existAttrs[contentsIdx].options = [contentsStr];
+        else existAttrs.push({name: 'תכולה', options: [contentsStr], visible: true, variation: false});
+    } else if (contentsIdx >= 0) {
+        existAttrs.splice(contentsIdx, 1);
     }
-    btn.textContent = '...'; btn.className = 'btn-save saving';
     tr.classList.remove('modified','saved','err');
+    tr.classList.add('saving');
     try {
-        var r = await wcPut('/products/' + pid, {name: name, categories: catId ? [{id: catId}] : [], tags: tagsList, attributes: existAttrs});
+        var brandId = await shpkResolveBrandId(brandStr);
+        var r = await wcPut('/products/' + pid, {
+            name: name, categories: catId ? [{id: catId}] : [], tags: tagsList,
+            brands: brandId ? [{id: brandId}] : [], regular_price: priceStr, attributes: existAttrs,
+        });
         var d = await r.json();
         if (d.code) throw new Error(d.message || 'שגיאה');
-        tr.dataset.attrs = JSON.stringify(d.attributes || existAttrs);
+        tr.dataset.attrs   = JSON.stringify(d.attributes || existAttrs);
+        tr.dataset.brandId = (d.brands && d.brands[0]) ? d.brands[0].id : 0;
+        tr.dataset.tagsAll = JSON.stringify(d.tags || []);
+        tr.classList.remove('saving');
         tr.classList.add('saved');
-        btn.textContent = '✓'; btn.className = 'btn-save ok';
         modified.delete(String(pid)); shpkRefreshBadge();
-        setTimeout(function(){ btn.textContent='שמור'; btn.className='btn-save'; tr.classList.remove('saved'); }, 2200);
+        setTimeout(function(){ tr.classList.remove('saved'); }, 2200);
     } catch(e) {
-        tr.classList.add('err'); btn.textContent = '✗'; btn.className = 'btn-save fail';
-        shpkToast('שגיאה: ' + e.message);
-        setTimeout(function(){ btn.textContent='שמור'; btn.className='btn-save'; }, 3000);
+        tr.classList.remove('saving');
+        tr.classList.add('err');
+        shpkToast('שגיאה בשמירת "' + name + '": ' + e.message);
     }
 };
 
-window.shpkToggle = async function(btn) {
-    var tr       = btn.closest('tr');
-    var pid      = +tr.dataset.pid;
-    var isHidden = tr.dataset.status === 'hidden';
-    var newVis   = isHidden ? 'visible' : 'hidden';
-    btn.disabled = true; btn.textContent = '...';
+// שינוי שם מותג/תגית — אותו endpoint גנרי (shpk_data_rename_term) שדף
+// עדכון המוצרים כבר משתמש בו. דורש term_id אמיתי, לכן תגית חדשה שעדיין
+// לא נשמרה (אין לה id עדיין) לא ניתנת לשינוי-שם עד אחרי שמירה.
+window.shpkRenameBrand = async function(btn) {
+    var tr = btn.closest('tr');
+    var id = +tr.dataset.brandId || 0;
+    var input = tr.querySelector('.inp-brand');
+    var currentName = input.value.trim();
+    if (!id || !currentName) { shpkToast('שמרו קודם מותג קיים כדי לשנות לו שם'); return; }
+    var newName = prompt('שם חדש למותג "' + currentName + '" (ישתנה בכל המוצרים שלו):', currentName);
+    if (newName === null) return;
+    newName = newName.trim();
+    if (!newName || newName === currentName) return;
+    var d = await ajaxPost('shpk_data_rename_term', {taxonomy: 'product_brand', term_id: id, new_name: newName});
+    if (!d.success) { shpkToast('שגיאה: ' + d.data); return; }
+    input.value = d.data.name;
+    var b = brands.find(function(x){ return x.id === id; });
+    if (b) b.name = d.data.name;
+    shpkToast('✓ שם המותג עודכן');
+};
+
+// שני כפתורים (לא toggle יחיד) — קובעים ישירות לאיזה מצב, כמו בדף
+// עדכון מוצר בנייד: שני המצבים תמיד גלויים, ברור מייד מה המצב הנוכחי.
+function shpkSetPillGroup(btn, activeClass) {
+    var group = btn.closest('.pill-group');
+    Array.prototype.forEach.call(group.querySelectorAll('.pill'), function(p){ p.className = 'pill pill-off'; });
+    btn.className = 'pill ' + activeClass;
+}
+
+window.shpkSetVisibility = async function(btn, newVis) {
+    var tr  = btn.closest('tr');
+    var pid = +tr.dataset.pid;
+    var prevClass = btn.className;
+    btn.disabled = true;
     try {
         var r = await wcPut('/products/' + pid, {catalog_visibility: newVis});
         var d = await r.json();
         if (d.code) throw new Error(d.message || 'שגיאה');
         tr.dataset.status = newVis;
-        if (newVis === 'hidden') { tr.classList.add('hidden-prod'); btn.textContent = 'הצג'; }
-        else                     { tr.classList.remove('hidden-prod'); btn.textContent = 'הסתר'; }
-        shpkToast(newVis === 'hidden' ? 'המוצר הוסתר מהחנות' : 'המוצר מוצג שוב בחנות');
+        tr.classList.toggle('hidden-prod', newVis === 'hidden');
+        shpkSetPillGroup(btn, newVis === 'hidden' ? 'pill-bad' : 'pill-ok');
+        shpkToast(newVis === 'hidden' ? 'המוצר סומן כהופסק להימכר (לא מוצג בחנות)' : 'המוצר מסומן כנמכר — מוצג בחנות');
     } catch(e) {
         shpkToast('שגיאה: ' + e.message);
-        btn.textContent = isHidden ? 'הצג' : 'הסתר';
+        btn.className = prevClass;
     }
     btn.disabled = false;
 };
 
-window.shpkDelete = async function(btn) {
-    var tr   = btn.closest('tr');
-    var name = tr.querySelector('.inp-name').value.trim();
-    if (!window.confirm('למחוק את המוצר "' + name + '"?\n(יועבר לפח — ניתן לשחזר מלוח הבקרה)')) return;
-    var pid  = +tr.dataset.pid;
-    btn.disabled = true; btn.textContent = '...';
+window.shpkSetStock = async function(btn, newStock) {
+    var tr  = btn.closest('tr');
+    var pid = +tr.dataset.pid;
+    var prevClass = btn.className;
+    btn.disabled = true;
     try {
-        var r = await wcDel('/products/' + pid);
+        var r = await wcPut('/products/' + pid, {stock_status: newStock});
         var d = await r.json();
         if (d.code) throw new Error(d.message || 'שגיאה');
-        tr.style.transition = 'opacity .3s';
-        tr.style.opacity = '0';
-        setTimeout(function(){ tr.remove(); modified.delete(String(pid)); shpkRefreshBadge(); }, 320);
-        shpkToast('המוצר נמחק (הועבר לפח)');
+        tr.dataset.stock = newStock;
+        shpkSetPillGroup(btn, newStock === 'outofstock' ? 'pill-bad' : 'pill-ok');
     } catch(e) {
         shpkToast('שגיאה: ' + e.message);
-        btn.disabled = false; btn.textContent = 'מחק';
+        btn.className = prevClass;
     }
+    btn.disabled = false;
 };
 
-window.shpkSuggest = async function(btn) {
-    var tr   = btn.closest('tr');
-    var name = tr.querySelector('.inp-name').value.trim();
-    var catEl = tr.querySelector('.parent-sel');
-    var cat  = catEl ? (catEl.options[catEl.selectedIndex] || {text:''}).text : '';
-    btn.disabled = true; btn.textContent = '⏳';
+window.shpkTogglePhotoFlag = async function(btn) {
+    var tr  = btn.closest('tr');
+    var pid = +tr.dataset.pid;
+    var isOn = tr.dataset.needsPhoto === '1';
+    var newVal = isOn ? '' : '1';
+    btn.disabled = true;
     try {
-        var d = await shpkAjax('shpk_suggest_tags', {name: name, cat: cat});
-        if (d.success) {
-            var brandInp = tr.querySelector('.inp-brand');
-            var tagsInp  = tr.querySelector('.inp-tags');
-            if (d.data.brand && brandInp && !brandInp.value) brandInp.value = d.data.brand;
-            if (d.data.tags  && d.data.tags.length && tagsInp && !tagsInp.value)
-                tagsInp.value = d.data.tags.join(', ');
-            shpkMark(btn);
-            shpkToast('הוצעו תגיות ומותג — בדוק ושמור');
-        } else {
-            shpkToast('שגיאה: ' + d.data);
-        }
-    } catch(e) { shpkToast('שגיאת רשת'); }
-    btn.disabled = false; btn.textContent = '💡';
+        var r = await wcPut('/products/' + pid, {meta_data: [{key: 'shpk_needs_photo_update', value: newVal}]});
+        var d = await r.json();
+        if (d.code) throw new Error(d.message || 'שגיאה');
+        tr.dataset.needsPhoto = newVal ? '1' : '0';
+        btn.textContent = newVal ? '🔧' : '📷';
+        btn.classList.toggle('on', !!newVal);
+        shpkToast(newVal ? 'סומן: צריך לצלם מחדש' : 'הדגל בוטל');
+    } catch(e) {
+        shpkToast('שגיאה: ' + e.message);
+    }
+    btn.disabled = false;
 };
 
 window.shpkMark = function(el) {
@@ -2298,7 +2667,7 @@ window.shpkSaveAll = async function() {
     var rows = Array.from(document.querySelectorAll('#shpk-tbody tr.modified'));
     if (!rows.length) return;
     btn.disabled = true; btn.textContent = 'שומר...';
-    for (var i = 0; i < rows.length; i++) await shpkSave(rows[i].querySelector('.btn-save'));
+    for (var i = 0; i < rows.length; i++) await shpkSave(rows[i]);
     btn.disabled = false; btn.style.display = 'none';
 };
 
@@ -2321,90 +2690,19 @@ function shpkRenderPager(page, total) {
     info.className = 'pg-info'; info.textContent = page + ' / ' + total; p.appendChild(info);
 }
 
-function shpkNextThursday() {
-    var d = new Date();
-    var dow = d.getDay(); // 0=Sun,1=Mon,...,4=Thu
-    var delta = (4 - dow + 7) % 7;
-    if (delta === 0) delta = 7; // today is Thursday → next Thursday
-    d.setDate(d.getDate() + delta);
-    return d.toISOString().slice(0, 10);
-}
-
-function shpkFormatHebrew(iso) {
-    if (!iso) return '';
-    var d = new Date(iso + 'T12:00:00');
-    var names = ['ראשון','שני','שלישי','רביעי','חמישי','שישי','שבת'];
-    return 'יום ' + names[d.getDay()] + ' ' + d.getDate() + '.' + (d.getMonth() + 1);
-}
-
-window.shpkUpdateDatePreview = function() {
-    var val = document.getElementById('shpk-ship-date').value;
-    document.getElementById('shpk-date-preview').textContent = shpkFormatHebrew(val);
+window.shpkToggleContentsCols = function() {
+    var show = document.getElementById('shpk-show-contents').checked;
+    document.getElementById('shpk-tbl').classList.toggle('hide-contents', !show);
+    try { localStorage.setItem('shpk_show_contents', show ? '1' : '0'); } catch(e) {}
 };
-
-function shpkLoadShipping() {
-    ajaxPost('shpk_get_shipping', {}).then(function(d) {
-        if (!d.success) return;
-        if (d.data.widget_id) shippingWidgetId = d.data.widget_id;
-        var today = new Date().toISOString().slice(0, 10);
-        var iso = (d.data.date && d.data.date > today) ? d.data.date : shpkNextThursday();
-        document.getElementById('shpk-ship-date').value = iso;
-        shpkUpdateDatePreview();
-        if (d.data.extra) document.getElementById('shpk-ship-extra').value = d.data.extra;
-    });
-}
-
-function shpkMakeBanner(isoDate, extra) {
-    var extraHtml = extra ? '<br><span style="font-size:.85rem;opacity:.85">' + extra + '</span>' : '';
-    // At page-load: if data-date is still in the future use it, else auto-compute next Thursday
-    var js = "(function(){" +
-        "if(sessionStorage.getItem('sk_sb'))return;" +
-        "var b=document.getElementById('sk-ship-bar');if(!b)return;" +
-        "var override=b.getAttribute('data-date');" +
-        "var today=new Date().toISOString().slice(0,10);" +
-        "var d=new Date();" +
-        "if(override&&override>today){" +
-        "d=new Date(override+'T12:00:00');" +
-        "}else{" +
-        "var delta=(4-d.getDay()+7)%7;" +
-        "if(delta===0)delta=7;" +
-        "d.setDate(d.getDate()+delta);" +
-        "}" +
-        "var nm=['ראשון','שני','שלישי','רביעי','חמישי','שישי','שבת'];" +
-        "var s=b.querySelector('.sk-ship-date');" +
-        "if(s)s.textContent='יום '+nm[d.getDay()]+' '+d.getDate()+'.'+(d.getMonth()+1);" +
-        "b.style.display='block';" +
-        "document.body.prepend?document.body.prepend(b):document.body.insertBefore(b,document.body.firstChild);" +
-        "})();";
-    return '<!-- wp:html -->\n' +
-        '<div id="sk-ship-bar" data-date="' + (isoDate || '') + '" style="display:none;background:#2d5a27;color:#fff;padding:.9rem 8rem .9rem 1.5rem;text-align:center;font-family:Rubik,sans-serif;font-size:1.05rem;position:relative;z-index:99999;box-shadow:0 2px 8px rgba(0,0,0,.25);line-height:1.5">\n' +
-        '  &#x1F4E6; <strong>המשלוח הבא: <span class="sk-ship-date"></span></strong>&nbsp;&nbsp;|&nbsp;&nbsp;&#x1F69A; משלוח רק 10&#8362;&nbsp;&nbsp;|&nbsp;&nbsp;חינם מהזמנה מעל 380&#8362;' + extraHtml + '\n' +
-        '  <button onclick="document.getElementById(\'sk-ship-bar\').style.display=\'none\';sessionStorage.setItem(\'sk_sb\',\'1\')" style="position:absolute;left:.75rem;top:50%;transform:translateY(-50%);background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.4);border-radius:6px;color:#fff;font-size:.85rem;font-family:Rubik,sans-serif;padding:.3rem .7rem;cursor:pointer;font-weight:600;white-space:nowrap" aria-label="סגור">הבנתי &#x2713;</button>\n' +
-        '</div>\n' +
-        '<scr' + 'ipt>\n' + js + '\n</sc' + 'ript>\n' +
-        '<!-- /wp:html -->';
-}
-
-window.shpkUpdateShipping = async function() {
-    var iso   = document.getElementById('shpk-ship-date').value;
-    var extra = document.getElementById('shpk-ship-extra').value.trim();
-    var st    = document.getElementById('shpk-ship-status');
-    if (!iso) { shpkToast('יש לבחור תאריך משלוח'); return; }
-    var hebrewDate = shpkFormatHebrew(iso);
-    st.textContent = 'מעדכן...'; st.style.color = '#888';
+(function(){
     try {
-        var saved = await ajaxPost('shpk_save_shipping', {date: iso, extra: extra});
-        if (!saved.success) throw new Error('שגיאה בשמירה');
-        var wr = await wpPut('/widgets/' + shippingWidgetId,
-            {sidebar: 'footer1', instance: {raw: {content: shpkMakeBanner(iso, extra)}}});
-        var wd = await wr.json();
-        if (wd.code) throw new Error(wd.message || 'widget error');
-        st.textContent = '✓ הבאנר עודכן — ' + hebrewDate; st.style.color = '#2d5a27';
-        setTimeout(function(){ st.textContent = ''; }, 6000);
-    } catch(e) {
-        st.textContent = '✗ ' + e.message; st.style.color = '#c62828';
-    }
-};
+        if (localStorage.getItem('shpk_show_contents') === '0') {
+            document.getElementById('shpk-show-contents').checked = false;
+            document.getElementById('shpk-tbl').classList.add('hide-contents');
+        }
+    } catch(e) {}
+})();
 
 window.shpkClearFilters = function() {
     document.getElementById('shpk-f-cat').value = '';
@@ -2527,6 +2825,54 @@ add_action('wp_head', function() {
         min-width: 180px;
     }
 }
+/* עגלת הקניות הצפה (woo-fly-cart): אייקון ההסרה הקיים לא קריא כסל-מחזור —
+   מחליפים אותו באמוג'י פח-זבל ברור, בלי תלות במה שהתוסף מרנדר בפנים. */
+.woofc-item-remove { position: relative; }
+.woofc-item-remove > * { visibility: hidden !important; }
+.woofc-item-remove::after {
+    visibility: visible !important;
+    content: "🗑️";
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 15px;
+}
+/* תגיות בעמוד מוצר — חותמות עגולות (ראו ה-JS ב-wp_footer שבונה את זה) */
+.shpk-tag-stamps { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.shpk-tag-stamp {
+    width: 36px; height: 36px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(circle at 32% 30%, #cdbb97, #9c6b46 75%);
+    text-decoration: none; font-size: 16px; line-height: 1;
+    border: 2px solid rgba(255,255,255,.5);
+    box-shadow: 0 1px 4px rgba(0,0,0,.25), inset 0 0 6px rgba(0,0,0,.15);
+    transition: transform .15s;
+}
+.shpk-tag-stamp:hover { transform: scale(1.12); }
+</style>
+    <?php
+});
+
+/* ── דפי השירות הפנימיים (ליקוט/משלוח/צילום/עדכון מוצרים): אלו דפי
+   עבודה לעובדים, לא דפים שיווקיים — מצמצמים את "הסביבה" של האתר
+   (כותרת/תפריט/פוטר/ווטסאפ/נגישות) כדי שכל המסך (בעיקר בטלפון) יהיה
+   תוכן רלוונטי. סלקטורים אומתו מול ה-HTML החי של האתר (תבנית Kadence,
+   ווטסאפ = creame-whatsapp-me/.joinchat, נגישות = userway-accessibility-widget). ── */
+add_action('wp_head', function() {
+    if (is_admin()) return;
+    if (!is_page(['picking', 'delivery', 'photo', 'data'])) return;
+    ?>
+<style>
+#masthead, #main-header, #mobile-header,
+#site-navigation, #mobile-site-navigation,
+#colophon, .joinchat, #userwayAccessibilityIcon,
+.skip-link {
+    display: none !important;
+}
+.content-area { margin-top: 0 !important; margin-bottom: 0 !important; }
+.entry-content-wrap { padding: .5rem !important; }
 </style>
     <?php
 });
@@ -2558,6 +2904,33 @@ document.addEventListener('DOMContentLoaded', function() {
         searchBtn.onclick = function() { window.location.href = SHPK_S; };
         mobileRight.insertBefore(searchBtn, mobileRight.firstChild);
     }
+
+    // עמוד מוצר: הסתרת שורת "מותג: ללא מותג" — כש"ללא מותג" הוא עצמו
+    // מותג מוקצה (לא רק "אין מותג בכלל"), עדיף לא להציג כלום מאשר להציג
+    // את המילים "ללא מותג" כעובדה על המוצר.
+    document.querySelectorAll('.posted_in').forEach(function(el) {
+        if (/^\s*מותג\s*:/.test(el.textContent) && /ללא מותג/.test(el.textContent)) {
+            el.style.display = 'none';
+        }
+    });
+
+    // עמוד מוצר: תגיות כ"חותמות" עגולות (ויזואלי) במקום רשימת טקסט —
+    // אותו אייקון גנרי לכולן (לא מעשי למפות אייקון ייחודי ל-4,500+
+    // תגיות), שם התגית מוצג כ-tooltip (title) במעבר עכבר/מגע.
+    document.querySelectorAll('.tagged_as').forEach(function(el) {
+        var links = Array.prototype.slice.call(el.querySelectorAll('a[rel="tag"]'));
+        if (!links.length) return;
+        el.innerHTML = '';
+        el.classList.add('shpk-tag-stamps');
+        links.forEach(function(a) {
+            var stamp = document.createElement('a');
+            stamp.href = a.getAttribute('href');
+            stamp.className = 'shpk-tag-stamp';
+            stamp.title = a.textContent;
+            stamp.innerHTML = '🏷️';
+            el.appendChild(stamp);
+        });
+    });
 });
 })();
 </script>
@@ -5143,6 +5516,49 @@ function shpk_photo_search_handler() {
 /* ── AJAX: פרטי מוצר מלאים (לכרטיס העריכה) ───────────────── */
 add_action('wp_ajax_shpk_photo_get_product',        'shpk_photo_get_product_handler');
 add_action('wp_ajax_nopriv_shpk_photo_get_product', 'shpk_photo_get_product_handler');
+/* ── "תכולה" (גודל/כמות יחידה — "60 קפסולות", "500 מ״ל", "1 ק\"ג")
+   כמאפיין מוצר מקומי (לא טקסונומיה) — זה בדיוק מה ש-WooCommerce מספק
+   באופן טבעי לשדה-עובדה מובנה על המוצר, בלי שום תוסף. ── */
+function shpk_get_contents_attr($product) {
+    foreach ($product->get_attributes() as $attr) {
+        if (!$attr->get_id() && $attr->get_name() === 'תכולה') {
+            $opts = $attr->get_options();
+            return $opts ? (string) $opts[0] : '';
+        }
+    }
+    return '';
+}
+function shpk_set_contents_attr($product, $value) {
+    $attrs = $product->get_attributes();
+    $existing_key = null;
+    foreach ($attrs as $key => $attr) {
+        if (!$attr->get_id() && $attr->get_name() === 'תכולה') { $existing_key = $key; break; }
+    }
+    if ($value === '') {
+        if ($existing_key !== null) unset($attrs[$existing_key]);
+    } else {
+        $a = new WC_Product_Attribute();
+        $a->set_id(0);
+        $a->set_name('תכולה');
+        $a->set_options([$value]);
+        $a->set_visible(true);
+        $a->set_variation(false);
+        $attrs[$existing_key !== null ? $existing_key : count($attrs)] = $a;
+    }
+    $product->set_attributes(array_values($attrs));
+}
+
+/* ── תצוגת "תכולה" בעמוד המוצר — שורה ברורה מתחת למחיר, לא רק
+   בתוך טאב "מידע נוסף" (שם זה כבר מוצג אוטומטית ע"י וורדפרס/ווקומרס
+   בזכות set_visible(true) למעלה — זו תוספת לנראות, לא תחליף). ── */
+add_action('woocommerce_single_product_summary', function () {
+    global $product;
+    if (!($product instanceof WC_Product)) return;
+    $contents = shpk_get_contents_attr($product);
+    if ($contents === '') return;
+    echo '<p class="shpk-contents" style="color:#555;font-size:15px;margin:-6px 0 10px">תכולה: <strong>' . esc_html($contents) . '</strong></p>';
+}, 11);
+
 function shpk_photo_get_product_handler() {
     check_ajax_referer('shushka_nonce', 'nonce');
     if (!shpk_photo_auth_ok()) { wp_send_json_error('unauthorized'); return; }
@@ -5169,17 +5585,22 @@ function shpk_photo_get_product_handler() {
         ? wp_get_post_terms($product_id, 'product_brand', ['fields' => 'ids'])
         : [];
 
+    $tags = array_map(function ($t) { return ['id' => (int) $t->term_id, 'name' => $t->name]; },
+        wp_get_post_terms($product_id, 'product_tag', ['fields' => 'all']));
+
     wp_send_json_success([
         'id'                => $product_id,
         'name'              => $product->get_name(),
         'sku'               => $product->get_sku(),
         'price'             => $product->get_regular_price(),
+        'contents'          => shpk_get_contents_attr($product),
         'description'       => $product->get_description(),
         'stock_status'      => $product->get_stock_status(),
         'visibility'        => $product->get_catalog_visibility(),
         'category_id'       => $parent_cat_id,
         'subcategory_id'    => $sub_cat_id,
         'brand_id'          => $brand_ids ? (int) $brand_ids[0] : 0,
+        'tags'              => $tags,
         'thumb'             => wp_get_attachment_image_url($product->get_image_id(), 'thumbnail') ?: '',
         'status'            => shpk_photo_status($product_id),
         'needs_photo_update' => (bool) get_post_meta($product_id, 'shpk_needs_photo_update', true),
@@ -5277,6 +5698,7 @@ function shpk_photo_update_details_handler() {
     $stock_status   = sanitize_text_field($_POST['stock_status'] ?? '');
     $visibility     = sanitize_text_field($_POST['visibility'] ?? '');
     $needs_update   = isset($_POST['needs_photo_update']) ? sanitize_text_field($_POST['needs_photo_update']) : null;
+    $contents       = isset($_POST['contents']) ? sanitize_text_field($_POST['contents']) : null;
 
     try {
         if ($name !== '') $product->set_name($name);
@@ -5285,6 +5707,7 @@ function shpk_photo_update_details_handler() {
         if ($description !== null) $product->set_description($description);
         if (in_array($stock_status, ['instock', 'outofstock'], true)) $product->set_stock_status($stock_status);
         if (in_array($visibility, ['visible', 'hidden'], true)) $product->set_catalog_visibility($visibility);
+        if ($contents !== null) shpk_set_contents_attr($product, $contents);
         $product->save();
     } catch (Exception $e) {
         wp_send_json_error($e->getMessage()); return;
@@ -5310,10 +5733,29 @@ function shpk_photo_update_details_handler() {
     }
     if ($brand_id && taxonomy_exists('product_brand')) wp_set_object_terms($product_id, [$brand_id], 'product_brand');
 
+    // תגיות: רשימת שמות מלאה (JSON) שמחליפה את כל התגיות הקיימות על המוצר.
+    // wp_set_object_terms יוצר אוטומטית תגית שעדיין לא קיימת — אין צורך
+    // בלוגיקת "יצירה אם חסר" נפרדת כמו אצל מותג.
+    if (isset($_POST['tags'])) {
+        $tag_names = json_decode(stripslashes($_POST['tags']), true);
+        if (is_array($tag_names)) {
+            $tag_names = array_map('sanitize_text_field', $tag_names);
+            wp_set_object_terms($product_id, $tag_names, 'product_tag', false);
+        }
+    }
+
     update_post_meta($product_id, 'shpk_data_reviewed', '1');
 
     if (ob_get_length()) ob_clean();
-    wp_send_json_success();
+    // מחזירים את המותג הסופי (קיים או שזה-עתה נוצר) כדי שהקליינט יוכל
+    // לעדכן את רשימת המותגים שבזיכרון שלו בלי רילוד — אחרת מותג שנוצר
+    // עכשיו "נעלם" מהחיפוש עד שטוענים את הדף מחדש.
+    $brand_out = null;
+    if ($brand_id && taxonomy_exists('product_brand')) {
+        $t = get_term($brand_id, 'product_brand');
+        if ($t && !is_wp_error($t)) $brand_out = ['id' => $brand_id, 'name' => $t->name];
+    }
+    wp_send_json_success(['brand' => $brand_out]);
 }
 
 /* ── עמוד הצילום/עריכה ────────────────────────────────────── */
@@ -5743,6 +6185,32 @@ add_action('admin_menu', function () {
         'manage_woocommerce', 'shushka-data', 'shpk_data_page');
 });
 
+/* ── AJAX: חיפוש תגיות (רשימה ענקית — אלפי תגיות — אי אפשר להטביע
+   הכל בדף כמו שעושים עם קטגוריות/מותגים; חיפוש שרת לפי הקלדה) ── */
+add_action('wp_ajax_shpk_data_tag_search',        'shpk_data_tag_search_handler');
+add_action('wp_ajax_nopriv_shpk_data_tag_search', 'shpk_data_tag_search_handler');
+function shpk_data_tag_search_handler() {
+    check_ajax_referer('shushka_nonce', 'nonce');
+    if (!shpk_photo_auth_ok()) { wp_send_json_error('unauthorized'); return; }
+
+    $q = sanitize_text_field($_GET['q'] ?? '');
+    if (mb_strlen($q) < 2) { wp_send_json_success([]); return; }
+
+    $terms = get_terms([
+        'taxonomy'   => 'product_tag',
+        'hide_empty' => false,
+        'name__like' => $q,
+        'number'     => 30,
+        'orderby'    => 'name',
+    ]);
+    $out = [];
+    if (!is_wp_error($terms)) {
+        foreach ($terms as $t) $out[] = ['id' => (int) $t->term_id, 'name' => $t->name];
+    }
+    if (ob_get_length()) ob_clean();
+    wp_send_json_success($out);
+}
+
 /* ── AJAX: רשימת מוצרים בקטגוריה/תת-קטגוריה נבחרת ───────── */
 add_action('wp_ajax_shpk_data_list_products',        'shpk_data_list_products_handler');
 add_action('wp_ajax_nopriv_shpk_data_list_products', 'shpk_data_list_products_handler');
@@ -5862,26 +6330,34 @@ function shpk_data_import_image_url_handler() {
     wp_send_json_success(['thumb' => wp_get_attachment_image_url($attach_id, 'thumbnail')]);
 }
 
-/* ── AJAX: שינוי שם מותג (term גלובלי — משפיע על כל המוצרים שלו) ── */
-add_action('wp_ajax_shpk_data_rename_brand',        'shpk_data_rename_brand_handler');
-add_action('wp_ajax_nopriv_shpk_data_rename_brand', 'shpk_data_rename_brand_handler');
-function shpk_data_rename_brand_handler() {
+/* ── AJAX: שינוי שם term גלובלי (מותג / קטגוריה / תגית) — לא יצירה/מחיקה,
+   רק שינוי שם, ומשפיע על כל המוצרים שמשתמשים בו. taxonomy מוגבל לרשימה
+   סגורה מטעמי בטיחות — אין לקרוא ל-handler הזה עם טקסונומיה שרירותית. ── */
+add_action('wp_ajax_shpk_data_rename_term',        'shpk_data_rename_term_handler');
+add_action('wp_ajax_nopriv_shpk_data_rename_term', 'shpk_data_rename_term_handler');
+function shpk_data_rename_term_handler() {
     check_ajax_referer('shushka_nonce', 'nonce');
     if (!shpk_photo_auth_ok()) { wp_send_json_error('unauthorized'); return; }
-    if (!taxonomy_exists('product_brand')) { wp_send_json_error('טקסונומיית מותג לא קיימת'); return; }
+
+    $taxonomy = sanitize_key($_POST['taxonomy'] ?? '');
+    if (!in_array($taxonomy, ['product_brand', 'product_cat', 'product_tag'], true)) {
+        wp_send_json_error('טקסונומיה לא נתמכת'); return;
+    }
+    if (!taxonomy_exists($taxonomy)) { wp_send_json_error('הטקסונומיה לא קיימת'); return; }
 
     $term_id  = absint($_POST['term_id'] ?? 0);
     $new_name = sanitize_text_field($_POST['new_name'] ?? '');
-    if (!$term_id || !get_term($term_id, 'product_brand')) { wp_send_json_error('מותג לא נמצא'); return; }
+    $term     = $term_id ? get_term($term_id, $taxonomy) : null;
+    if (!$term || is_wp_error($term)) { wp_send_json_error('הפריט לא נמצא'); return; }
     if ($new_name === '') { wp_send_json_error('שם חדש חסר'); return; }
 
-    $existing = get_term_by('name', $new_name, 'product_brand');
+    $existing = get_term_by('name', $new_name, $taxonomy);
     if ($existing && (int) $existing->term_id !== $term_id) {
-        wp_send_json_error('כבר קיים מותג בשם הזה — למיזוג בין שני מותגים צריך טיפול ידני');
+        wp_send_json_error('כבר קיים פריט בשם הזה — למיזוג צריך טיפול ידני');
         return;
     }
 
-    $result = wp_update_term($term_id, 'product_brand', ['name' => $new_name]);
+    $result = wp_update_term($term_id, $taxonomy, ['name' => $new_name]);
     if (is_wp_error($result)) { wp_send_json_error($result->get_error_message()); return; }
 
     if (ob_get_length()) ob_clean();
@@ -5938,6 +6414,25 @@ function shpk_data_page($frontend = false) {
         font-size:14px;font-weight:600;cursor:pointer;font-family:inherit}
     .sdw-toggle button.sdw-on{border-color:#183625;background:#183625;color:#fff}
     .sdw-sku-display{font-size:15px;color:#555;background:#f7f7f7;border-radius:8px;padding:10px;margin-bottom:8px}
+    /* תוצאות חיפוש (מותג/תגית) — פאנל רגיל בזרימת הדף (לא צף), כדי שיתנהג
+       יציב בדפדפני מובייל שונים; כל שורה גדולה ונוחה למגע. שם כללי כי
+       נעשה בו שימוש גם לתגיות, לא רק למותג. */
+    .sdw-combo-results{display:none;max-height:260px;overflow-y:auto;border:1px solid #ddd;border-radius:8px;margin:-4px 0 8px;background:#fff}
+    .sdw-combo-results.show{display:block}
+    .sdw-combo-row{padding:12px 14px;font-size:15px;border-bottom:1px solid #f0f0f0;cursor:pointer}
+    .sdw-combo-row:last-child{border-bottom:none}
+    .sdw-combo-row:active,.sdw-combo-row:hover{background:#f5f5f5}
+    .sdw-combo-row-new{color:#183625;font-weight:700}
+    /* צ'יפים של תגיות נבחרות */
+    .sdw-chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+    .sdw-chip{display:inline-flex;align-items:center;gap:6px;background:#eef3ec;border:1px solid #cfe0cb;
+        border-radius:16px;padding:6px 6px 6px 12px;font-size:14px}
+    .sdw-chip button{background:none;border:none;color:#777;font-size:15px;cursor:pointer;line-height:1;padding:2px 4px}
+    .sdw-chip-edit{background:none;border:none;color:#183625;font-size:13px;cursor:pointer;padding:0 2px}
+    .sdw-unit-row{display:flex;gap:8px}
+    .sdw-unit-row input{margin-bottom:8px}
+    .sdw-unit-row input[type=number]{flex:1}
+    .sdw-unit-row input[type=text]{flex:2}
     #sdw-thumb{width:100%;max-width:180px;display:block;margin:6px auto 10px;border-radius:8px;background:#f2f2f2}
     #sdw-paste-zone{border:2px dashed #ccc;border-radius:8px;padding:14px;text-align:center;color:#999;font-size:13px;
         margin-bottom:4px;min-height:20px}
@@ -5979,28 +6474,48 @@ function shpk_data_page($frontend = false) {
             <input type="text" id="sdw-name" style="font-weight:600">
 
             <label class="sdw-field-label">קטגוריה</label>
-            <select id="sdw-edit-cat-parent"></select>
+            <div style="display:flex;gap:6px;align-items:center">
+                <select id="sdw-edit-cat-parent" style="flex:1;margin-bottom:0"></select>
+                <button type="button" onclick="sdwRenameCategory(editParent, 'parent')" title="שנה שם לקטגוריה (ישתנה באתר כולו)"
+                    style="flex-shrink:0;height:44px;padding:0 12px;border:1px solid #ccc;border-radius:8px;background:#fff;font-size:17px;cursor:pointer">✏️</button>
+            </div>
             <label class="sdw-field-label">תת-קטגוריה</label>
-            <select id="sdw-edit-cat-sub"></select>
+            <div style="display:flex;gap:6px;align-items:center">
+                <select id="sdw-edit-cat-sub" style="flex:1;margin-bottom:0"></select>
+                <button type="button" onclick="sdwRenameCategory(editSub, 'sub')" title="שנה שם לתת-קטגוריה (ישתנה באתר כולו)"
+                    style="flex-shrink:0;height:44px;padding:0 12px;border:1px solid #ccc;border-radius:8px;background:#fff;font-size:17px;cursor:pointer">✏️</button>
+            </div>
 
             <?php if ($brand_tax_exists): ?>
-            <label class="sdw-field-label">מותג</label>
+            <label class="sdw-field-label">מותג (הקלידו לחיפוש)</label>
             <div style="display:flex;gap:6px;align-items:center">
-                <select id="sdw-brand" onchange="sdwOnBrandChange()" style="flex:1;margin-bottom:0">
-                    <option value="0">— ללא שינוי —</option>
-                    <?php foreach ($brands as $b): ?>
-                        <option value="<?php echo (int)$b->term_id; ?>"><?php echo esc_html($b->name); ?></option>
-                    <?php endforeach; ?>
-                    <option value="__new__">+ מותג חדש...</option>
-                </select>
+                <input type="text" id="sdw-brand-search" autocomplete="off" placeholder="הקלידו לחיפוש מותג..." style="flex:1;margin-bottom:0">
+                <button type="button" onclick="brandSetValue(0); brandSearch.focus();" title="נקה כדי לבחור מותג אחר"
+                    style="flex-shrink:0;height:44px;padding:0 10px;border:1px solid #ccc;border-radius:8px;background:#fff;font-size:17px;cursor:pointer">✕</button>
                 <button type="button" onclick="sdwRenameBrand()" title="שנה שם למותג הנבחר (ישתנה בכל המוצרים שלו)"
                     style="flex-shrink:0;height:44px;padding:0 12px;border:1px solid #ccc;border-radius:8px;background:#fff;font-size:17px;cursor:pointer">✏️</button>
             </div>
+            <div id="sdw-brand-results" class="sdw-combo-results"></div>
             <input type="text" id="sdw-brand-new" placeholder="שם המותג החדש" style="display:none">
             <?php endif; ?>
 
+            <label class="sdw-field-label">תגיות</label>
+            <div id="sdw-tag-chips" class="sdw-chips"></div>
+            <input type="text" id="sdw-tag-search" autocomplete="off" placeholder="הקלידו לחיפוש/הוספת תגית...">
+            <div id="sdw-tag-results" class="sdw-combo-results"></div>
+
             <label class="sdw-field-label">מחיר רגיל (₪)</label>
             <input type="number" id="sdw-price" step="0.1" min="0">
+
+            <label class="sdw-field-label">תכולה / גודל</label>
+            <div class="sdw-unit-row">
+                <input type="number" id="sdw-contents-qty" step="any" min="0" placeholder="כמות (למשל 500)">
+                <input type="text" id="sdw-contents-unit" list="sdw-units-list" placeholder="יחידה (למשל מ״ל)">
+                <datalist id="sdw-units-list">
+                    <option value="גרם"><option value="קילוגרם"><option value="מ״ל"><option value="ליטר">
+                    <option value="יחידות"><option value="קפסולות"><option value="חבילה"><option value="שקית">
+                </datalist>
+            </div>
 
             <label class="sdw-field-label">ברקוד / SKU</label>
             <div class="sdw-sku-display" id="sdw-sku-display">—</div>
@@ -6051,6 +6566,10 @@ function shpk_data_page($frontend = false) {
     cats.filter(function(c){ return c.parent !== 0; }).forEach(function(c){
         (catChildren[c.parent] = catChildren[c.parent] || []).push(c);
     });
+
+    var allBrands = <?php echo json_encode(array_map(function($b){
+        return ['id' => (int) $b->term_id, 'name' => $b->name];
+    }, $brands)); ?>;
 
     var queue = [];      // [{id, name, thumb, reviewed, visibility, photo_status}, ...]
     var queueIdx = -1;
@@ -6172,6 +6691,12 @@ function shpk_data_page($frontend = false) {
                 curProduct = d.data;
                 document.getElementById('sdw-name').value = curProduct.name || '';
                 document.getElementById('sdw-price').value = curProduct.price || '';
+                // תכולה מגיעה מהשרת כמחרוזת אחת ("500 מ\"ל") — מפרקים לשני
+                // שדות עריכה (מספר מוביל + שאר הטקסט כיחידה); נשמר שוב
+                // כמחרוזת אחת משולבת, כדי שתוצג כשורה אחת נקייה במוצר.
+                var contentsMatch = /^(\d+(?:\.\d+)?)\s*(.*)$/.exec((curProduct.contents || '').trim());
+                document.getElementById('sdw-contents-qty').value  = contentsMatch ? contentsMatch[1] : '';
+                document.getElementById('sdw-contents-unit').value = contentsMatch ? contentsMatch[2] : (curProduct.contents || '');
                 document.getElementById('sdw-sku-display').textContent = curProduct.sku || '— אין —';
                 document.getElementById('sdw-description').value = curProduct.description ? curProduct.description.replace(/<[^>]+>/g, '') : '';
                 document.getElementById('sdw-thumb').src = curProduct.thumb || '';
@@ -6181,12 +6706,9 @@ function shpk_data_page($frontend = false) {
                 else { link.style.display = 'none'; }
 
                 buildEditCatSelects(curProduct.category_id || 0, curProduct.subcategory_id || 0);
-                var brandSel = document.getElementById('sdw-brand');
-                if (brandSel) {
-                    brandSel.value = curProduct.brand_id ? String(curProduct.brand_id) : '0';
-                    document.getElementById('sdw-brand-new').style.display = 'none';
-                    document.getElementById('sdw-brand-new').value = '';
-                }
+                if (document.getElementById('sdw-brand-search')) brandSetValue(curProduct.brand_id || 0);
+                selectedTags = (curProduct.tags || []).slice();
+                renderTagChips();
                 toggles.stock = curProduct.stock_status === 'outofstock' ? 'outofstock' : 'instock';
                 toggles.visibility = curProduct.visibility === 'hidden' ? 'hidden' : 'visible';
                 toggles.needsUpdate = curProduct.needs_photo_update ? '1' : '0';
@@ -6219,33 +6741,186 @@ function shpk_data_page($frontend = false) {
         });
     }
 
-    window.sdwOnBrandChange = function() {
-        var brandSel = document.getElementById('sdw-brand');
-        var newInput = document.getElementById('sdw-brand-new');
-        newInput.style.display = (brandSel.value === '__new__') ? 'block' : 'none';
-        if (brandSel.value === '__new__') newInput.focus();
-    };
+    // ── בחירת מותג: שדה חיפוש + רשימה מסוננת (לא <select>) — ברשימות
+    // ארוכות גלילה בטלפון איטית; כאן מתחילים להקליד וכל שורה גדולה ונוחה
+    // למגע. brandCombo.id: 0=ללא שינוי, '__new__'=מותג חדש, אחרת מספר term_id.
+    var brandCombo   = {id: 0};
+    var brandSearch  = document.getElementById('sdw-brand-search');
+    var brandResults = document.getElementById('sdw-brand-results');
+    var brandNewEl   = document.getElementById('sdw-brand-new');
+
+    function brandSetValue(id) {
+        var b = allBrands.find(function(x){ return x.id === id; });
+        brandCombo.id = b ? b.id : 0;
+        if (brandSearch) brandSearch.value = b ? b.name : '';
+        if (brandNewEl) { brandNewEl.style.display = 'none'; brandNewEl.value = ''; }
+        hideBrandResults();
+    }
+    function hideBrandResults() { if (brandResults) brandResults.classList.remove('show'); }
+
+    if (brandSearch) {
+        function renderBrandResults() {
+            var q = brandSearch.value.trim().toLowerCase();
+            // בלי הגבלת כמות: הפאנל גולל (max-height+overflow-y) אז רשימה מלאה
+            // עדיין נוחה — הגבלה ל-N תוצאות חתכה בעבר את הרשימה באמצע האלף-בית
+            // (שמות לועזיים ממוינים לפני עבריים, אז "60 ראשונים" = לא כל העברית)
+            var matches = allBrands.filter(function(b){ return !q || b.name.toLowerCase().indexOf(q) !== -1; });
+            var html = matches.map(function(b){
+                return '<div class="sdw-combo-row" data-id="' + b.id + '">' + esc(b.name) + '</div>';
+            }).join('');
+            html += '<div class="sdw-combo-row sdw-combo-row-new" data-id="__new__">+ מותג חדש' +
+                (brandSearch.value.trim() ? ': ' + esc(brandSearch.value.trim()) : '...') + '</div>';
+            brandResults.innerHTML = html;
+            brandResults.classList.add('show');
+            Array.prototype.forEach.call(brandResults.querySelectorAll('.sdw-combo-row'), function(row){
+                // mousedown (לא click) + preventDefault: כדי שה-blur של שדה החיפוש
+                // לא יספיק לסגור את הרשימה לפני שהבחירה נרשמת (קלאסי בנגיעה במובייל)
+                row.addEventListener('mousedown', function(e){
+                    e.preventDefault();
+                    var id = row.getAttribute('data-id');
+                    if (id === '__new__') {
+                        var typed = brandSearch.value.trim();
+                        brandCombo.id = '__new__';
+                        brandSearch.value = '';
+                        hideBrandResults();
+                        brandNewEl.style.display = 'block';
+                        brandNewEl.value = typed;
+                        brandNewEl.focus();
+                    } else {
+                        brandSetValue(+id);
+                    }
+                    markDirty();
+                });
+            });
+        }
+        // בחירת כל הטקסט בפוקוס: ככה הקלדה ראשונה פשוט דורסת את המותג
+        // הקיים, בלי צורך למחוק אותו ידנית קודם (כמו בשדה כתובת בדפדפן)
+        brandSearch.addEventListener('focus', function(){ this.select(); renderBrandResults(); });
+        brandSearch.addEventListener('input', function(){ brandCombo.id = 0; renderBrandResults(); });
+        brandSearch.addEventListener('blur', function(){ setTimeout(hideBrandResults, 150); });
+    }
 
     window.sdwRenameBrand = function() {
-        var brandSel = document.getElementById('sdw-brand');
-        if (!brandSel || brandSel.value === '0' || brandSel.value === '__new__') {
+        if (!brandCombo.id || brandCombo.id === '__new__') {
             toast('בחרו מותג קיים לפני שינוי שם'); return;
         }
-        var termId = brandSel.value;
-        var opt = brandSel.options[brandSel.selectedIndex];
-        var currentName = opt.textContent;
+        var termId = brandCombo.id;
+        var currentName = brandSearch.value;
         var newName = prompt('שם חדש למותג "' + currentName + '" (ישתנה בכל המוצרים שמשתמשים בו):', currentName);
         if (newName === null) return;
         newName = newName.trim();
         if (!newName || newName === currentName) return;
 
-        var fd = new URLSearchParams({action: 'shpk_data_rename_brand', nonce: NONCE, term_id: termId, new_name: newName});
+        var fd = new URLSearchParams({action: 'shpk_data_rename_term', taxonomy: 'product_brand', nonce: NONCE, term_id: termId, new_name: newName});
         fetch(AJAX, {method: 'POST', body: fd}).then(function(r){ return r.json(); }).then(function(d){
             if (!d.success) { toast('שגיאה: ' + (d.data || '')); return; }
-            opt.textContent = d.data.name;
+            var b = allBrands.find(function(x){ return x.id === termId; });
+            if (b) b.name = d.data.name;
+            brandSearch.value = d.data.name;
             toast('✓ שם המותג עודכן בהצלחה');
         }).catch(function(){ toast('שגיאת תקשורת — נסו שוב'); });
     };
+
+    // ── שינוי שם קטגוריה/תת-קטגוריה — לא הוספה/הסרה, רק שם ──────
+    window.sdwRenameCategory = function(selectEl, kind) {
+        var id = +selectEl.value || 0;
+        if (!id) { toast('בחרו קטגוריה קיימת לפני שינוי שם'); return; }
+        var currentName = selectEl.options[selectEl.selectedIndex].textContent;
+        var newName = prompt('שם חדש ל-"' + currentName + '" (ישתנה באתר כולו):', currentName);
+        if (newName === null) return;
+        newName = newName.trim();
+        if (!newName || newName === currentName) return;
+
+        var fd = new URLSearchParams({action: 'shpk_data_rename_term', taxonomy: 'product_cat', nonce: NONCE, term_id: id, new_name: newName});
+        fetch(AJAX, {method: 'POST', body: fd}).then(function(r){ return r.json(); }).then(function(d){
+            if (!d.success) { toast('שגיאה: ' + (d.data || '')); return; }
+            var list = kind === 'parent' ? catParents : (catChildren[+editParent.value] || []);
+            var c = list.find(function(x){ return x.id === id; });
+            if (c) c.name = d.data.name;
+            var opt = selectEl.options[selectEl.selectedIndex];
+            opt.textContent = d.data.name;
+            toast('✓ השם עודכן בהצלחה');
+        }).catch(function(){ toast('שגיאת תקשורת — נסו שוב'); });
+    };
+
+    // ── תגיות: צ'יפים + חיפוש שרת (הרשימה ענקית — אלפי תגיות, אי אפשר
+    // להטביע הכל בדף כמו מותגים/קטגוריות) + אפשרות ליצור תגית חדשה ──
+    var selectedTags  = [];  // [{id, name}, ...]
+    var tagSearch      = document.getElementById('sdw-tag-search');
+    var tagResults      = document.getElementById('sdw-tag-results');
+    var tagChipsEl      = document.getElementById('sdw-tag-chips');
+    var tagSearchTimer  = null;
+
+    function renderTagChips() {
+        tagChipsEl.innerHTML = selectedTags.map(function(t, i){
+            return '<span class="sdw-chip">' + esc(t.name) +
+                (t.id ? '<button type="button" class="sdw-chip-edit" data-i="' + i + '" data-act="rename" title="שנה שם לתגית (באתר כולו)">✏️</button>' : '') +
+                '<button type="button" data-i="' + i + '" data-act="remove" title="הסר">✕</button></span>';
+        }).join('');
+        Array.prototype.forEach.call(tagChipsEl.querySelectorAll('button'), function(btn){
+            btn.addEventListener('click', function(){
+                var i = +btn.getAttribute('data-i');
+                if (btn.getAttribute('data-act') === 'remove') {
+                    selectedTags.splice(i, 1);
+                    renderTagChips();
+                    markDirty();
+                } else {
+                    sdwRenameTag(selectedTags[i]);
+                }
+            });
+        });
+    }
+    function sdwRenameTag(tag) {
+        var newName = prompt('שם חדש לתגית "' + tag.name + '" (ישתנה בכל מקום שהיא מופיעה באתר):', tag.name);
+        if (newName === null) return;
+        newName = newName.trim();
+        if (!newName || newName === tag.name) return;
+        var fd = new URLSearchParams({action: 'shpk_data_rename_term', taxonomy: 'product_tag', nonce: NONCE, term_id: tag.id, new_name: newName});
+        fetch(AJAX, {method: 'POST', body: fd}).then(function(r){ return r.json(); }).then(function(d){
+            if (!d.success) { toast('שגיאה: ' + (d.data || '')); return; }
+            tag.name = d.data.name;
+            renderTagChips();
+            toast('✓ שם התגית עודכן בהצלחה');
+        }).catch(function(){ toast('שגיאת תקשורת — נסו שוב'); });
+    }
+    function hideTagResults() { tagResults.classList.remove('show'); }
+    function addTag(t) {
+        if (!selectedTags.some(function(x){ return x.id ? x.id === t.id : x.name === t.name; })) {
+            selectedTags.push(t);
+            renderTagChips();
+            markDirty();
+        }
+        tagSearch.value = '';
+        hideTagResults();
+    }
+    if (tagSearch) {
+        tagSearch.addEventListener('input', function(){
+            clearTimeout(tagSearchTimer);
+            var q = tagSearch.value.trim();
+            if (q.length < 2) { hideTagResults(); return; }
+            tagSearchTimer = setTimeout(function(){
+                fetch(AJAX + '?action=shpk_data_tag_search&nonce=' + NONCE + '&q=' + encodeURIComponent(q))
+                    .then(function(r){ return r.json(); }).then(function(d){
+                        if (!d.success) return;
+                        var html = d.data.map(function(t){
+                            return '<div class="sdw-combo-row" data-id="' + t.id + '">' + esc(t.name) + '</div>';
+                        }).join('');
+                        html += '<div class="sdw-combo-row sdw-combo-row-new" data-id="__new__">+ תגית חדשה: ' + esc(q) + '</div>';
+                        tagResults.innerHTML = html;
+                        tagResults.classList.add('show');
+                        Array.prototype.forEach.call(tagResults.querySelectorAll('.sdw-combo-row'), function(row){
+                            row.addEventListener('mousedown', function(e){
+                                e.preventDefault();
+                                var id = row.getAttribute('data-id');
+                                if (id === '__new__') addTag({id: 0, name: q});
+                                else addTag({id: +id, name: d.data.find(function(t){ return t.id === +id; }).name});
+                            });
+                        });
+                    });
+            }, 300);
+        });
+        tagSearch.addEventListener('blur', function(){ setTimeout(hideTagResults, 150); });
+    }
 
     var saveBtn = document.getElementById('sdw-save-btn');
     function resetSaveBtn() {
@@ -6254,7 +6929,7 @@ function shpk_data_page($frontend = false) {
         saveBtn.classList.remove('sdw-saved');
     }
     function markDirty() { dirty = true; resetSaveBtn(); }
-    ['sdw-name', 'sdw-price', 'sdw-description', 'sdw-edit-cat-sub', 'sdw-brand', 'sdw-brand-new'].forEach(function(id){
+    ['sdw-name', 'sdw-price', 'sdw-contents-qty', 'sdw-contents-unit', 'sdw-description', 'sdw-edit-cat-sub', 'sdw-brand-new'].forEach(function(id){
         var el = document.getElementById(id);
         if (!el) return;
         el.addEventListener('input', markDirty);
@@ -6263,11 +6938,12 @@ function shpk_data_page($frontend = false) {
 
     window.sdwOpenGoogleImages = function() {
         if (!curProduct) return;
-        var brandSel = document.getElementById('sdw-brand');
-        var brandName = brandSel && brandSel.value !== '0' && brandSel.value !== '__new__'
-            ? (brandSel.options[brandSel.selectedIndex].textContent || '') : '';
+        var brandName = (brandCombo.id && brandCombo.id !== '__new__') ? brandSearch.value : '';
         var q = (document.getElementById('sdw-name').value || '') + ' ' + brandName;
-        window.open('https://www.google.com/search?tbm=isch&q=' + encodeURIComponent(q.trim()), '_blank');
+        // tbs=sur:fmc מגביל לתמונות עם רישיון "חופשי לשימוש, שיתוף ושינוי —
+        // גם למטרות מסחריות" (Google's usage-rights filter), כדי לא להסתכן
+        // בהפרת זכויות יוצרים כשמביאים תמונת מוצר מגוגל
+        window.open('https://www.google.com/search?tbm=isch&tbs=sur:fmc&q=' + encodeURIComponent(q.trim()), '_blank');
     };
 
     var pasteStatusEl = document.getElementById('sdw-paste-status');
@@ -6328,19 +7004,22 @@ function shpk_data_page($frontend = false) {
 
     window.sdwSaveAndNext = function() {
         if (!curProduct) return;
-        var brandSel = document.getElementById('sdw-brand');
-        var isNewBrand = brandSel && brandSel.value === '__new__';
+        var isNewBrand = brandCombo.id === '__new__';
+        var qty  = document.getElementById('sdw-contents-qty').value.trim();
+        var unit = document.getElementById('sdw-contents-unit').value.trim();
         var fd = new URLSearchParams({
             action: 'shpk_photo_update_details',
             nonce: NONCE,
             product_id: curProduct.id,
             name: document.getElementById('sdw-name').value.trim(),
             price: document.getElementById('sdw-price').value,
+            contents: (qty + ' ' + unit).trim(),
             description: document.getElementById('sdw-description').value,
             category_id: editParent.value,
             subcategory_id: editSub.value,
-            brand_id: (brandSel && !isNewBrand) ? brandSel.value : 0,
+            brand_id: !isNewBrand ? (brandCombo.id || 0) : 0,
             new_brand_name: isNewBrand ? document.getElementById('sdw-brand-new').value.trim() : '',
+            tags: JSON.stringify(selectedTags.map(function(t){ return t.name; })),
             stock_status: toggles.stock,
             visibility: toggles.visibility,
             needs_photo_update: toggles.needsUpdate,
@@ -6349,6 +7028,13 @@ function shpk_data_page($frontend = false) {
         saveBtn.textContent = '⏳ שומר...';
         fetch(AJAX, {method: 'POST', body: fd}).then(function(r){ return r.json(); }).then(function(d){
             if (!d.success) { resetSaveBtn(); toast('שגיאה: ' + (d.data || '')); return; }
+            // מותג חדש שנוצר עכשיו: מוסיפים לרשימה שבזיכרון כדי שיהיה חיפוש
+            // אותו מיד, בלי רילוד של הדף (אחרת הוא "נעלם" עד שהדף נטען מחדש)
+            if (d.data && d.data.brand && !allBrands.some(function(b){ return b.id === d.data.brand.id; })) {
+                allBrands.push(d.data.brand);
+                allBrands.sort(function(a, b){ return a.name.localeCompare(b.name, 'he'); });
+            }
+            if (d.data && d.data.brand) brandSetValue(d.data.brand.id);
             dirty = false;
             queue[queueIdx].reviewed = true;
             queue[queueIdx].name = document.getElementById('sdw-name').value.trim();
@@ -6371,6 +7057,174 @@ function shpk_data_page($frontend = false) {
         });
     };
     })();
+    </script>
+    <?php
+}
+
+/* ═══════════════════════════════════════════════════════════
+   "הודיעו לי כשחוזר למלאי" — ללא תוסף תשלום (v5.9.0)
+   כפתור במוצר שאזל מהמלאי שולח הודעת WhatsApp מהלקוח לחנות (המספר
+   כבר ברור מהוואטסאפ עצמו — אין צורך לאסוף טלפון בנפרד), ושומר רישום
+   בטבלה פנימית. דף אדמין מרכז את כל המוצרים שאזלו + מספר הפניות לכל
+   אחד + כפתור לסמן שחזר למלאי.
+   ═══════════════════════════════════════════════════════════ */
+
+define('SHPK_RESTOCK_TABLE_VER', '1');
+
+function shpk_restock_table_name() {
+    global $wpdb;
+    return $wpdb->prefix . 'shpk_restock_requests';
+}
+
+function shpk_restock_maybe_create_table() {
+    if (get_option('shpk_restock_table_ver') === SHPK_RESTOCK_TABLE_VER) return;
+    global $wpdb;
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+    $table           = shpk_restock_table_name();
+    $charset_collate = $wpdb->get_charset_collate();
+    dbDelta("CREATE TABLE $table (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        product_id BIGINT UNSIGNED NOT NULL,
+        product_name VARCHAR(255) NOT NULL,
+        created_at DATETIME NOT NULL,
+        PRIMARY KEY (id),
+        KEY product_id (product_id)
+    ) $charset_collate;");
+    update_option('shpk_restock_table_ver', SHPK_RESTOCK_TABLE_VER);
+}
+
+/* ── כפתור בעמוד מוצר שאזל מהמלאי ────────────────────────── */
+add_action('woocommerce_single_product_summary', function () {
+    global $product;
+    if (!($product instanceof WC_Product) || $product->is_in_stock()) return;
+
+    $text   = 'שלום, אני מעוניין/ת במוצר "' . $product->get_name() . '" ומחכה שיחזור למלאי. אפשר לעדכן אותי כשהוא זמין?';
+    $wa_url = 'https://wa.me/' . shpk_whatsapp_phone() . '?text=' . rawurlencode($text);
+    ?>
+    <div class="shpk-restock-cta" style="margin:14px 0">
+        <button type="button" onclick="shpkRestockRequest(this)"
+            data-pid="<?php echo (int) $product->get_id(); ?>"
+            data-wa="<?php echo esc_attr($wa_url); ?>"
+            style="background:#25D366;color:#fff;border:none;padding:12px 20px;border-radius:8px;font-size:15px;
+                   font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:8px">
+            🔔 הודיעו לי כשהמוצר חוזר למלאי
+        </button>
+    </div>
+    <script>
+    function shpkRestockRequest(btn) {
+        var fd = new URLSearchParams({
+            action: 'shpk_restock_log',
+            nonce: <?php echo json_encode(wp_create_nonce('shpk_restock_nonce')); ?>,
+            product_id: btn.getAttribute('data-pid'),
+        });
+        fetch(<?php echo json_encode(admin_url('admin-ajax.php')); ?>, {method: 'POST', body: fd}).catch(function(){});
+        window.open(btn.getAttribute('data-wa'), '_blank');
+    }
+    </script>
+    <?php
+}, 31);
+
+/* ── AJAX: רישום פנייה (ציבורי — לקוח לא מחובר) ──────────── */
+add_action('wp_ajax_shpk_restock_log',        'shpk_restock_log_handler');
+add_action('wp_ajax_nopriv_shpk_restock_log', 'shpk_restock_log_handler');
+function shpk_restock_log_handler() {
+    check_ajax_referer('shpk_restock_nonce', 'nonce');
+
+    $product_id = absint($_POST['product_id'] ?? 0);
+    $product    = $product_id ? wc_get_product($product_id) : null;
+    if (!$product) { wp_send_json_error('מוצר לא נמצא'); return; }
+
+    shpk_restock_maybe_create_table();
+    global $wpdb;
+    $wpdb->insert(shpk_restock_table_name(), [
+        'product_id'   => $product_id,
+        'product_name' => $product->get_name(),
+        'created_at'   => current_time('mysql'),
+    ]);
+
+    if (ob_get_length()) ob_clean();
+    wp_send_json_success();
+}
+
+/* ── AJAX: סימון "חזר למלאי" (אדמין בלבד) ────────────────── */
+add_action('wp_ajax_shpk_restock_mark_instock', function () {
+    check_ajax_referer('shpk_restock_admin', 'nonce');
+    if (!current_user_can('manage_woocommerce')) { wp_send_json_error('אין הרשאה'); return; }
+
+    $product_id = absint($_POST['product_id'] ?? 0);
+    $product    = $product_id ? wc_get_product($product_id) : null;
+    if (!$product) { wp_send_json_error('מוצר לא נמצא'); return; }
+
+    $product->set_stock_status('instock');
+    $product->save();
+
+    if (ob_get_length()) ob_clean();
+    wp_send_json_success();
+});
+
+/* ── דף אדמין: ריכוז מוצרים שאזלו מהמלאי ─────────────────── */
+add_action('admin_menu', function () {
+    add_submenu_page('shushka-pick', 'מוצרים שאזלו מהמלאי', '📦 אזל מהמלאי',
+        'manage_woocommerce', 'shushka-restock', 'shpk_restock_admin_page');
+});
+
+function shpk_restock_admin_page() {
+    if (!current_user_can('manage_woocommerce')) wp_die('אין הרשאה');
+    shpk_restock_maybe_create_table();
+
+    global $wpdb;
+    $table    = shpk_restock_table_name();
+    $products = wc_get_products(['stock_status' => 'outofstock', 'limit' => -1]);
+
+    $rows = [];
+    foreach ($products as $p) {
+        $pid    = $p->get_id();
+        $counts = $wpdb->get_row($wpdb->prepare(
+            "SELECT COUNT(*) AS cnt, MAX(created_at) AS last_at FROM $table WHERE product_id = %d", $pid
+        ));
+        $rows[] = ['product' => $p, 'count' => (int) ($counts->cnt ?? 0), 'last_at' => $counts->last_at ?? ''];
+    }
+    usort($rows, function ($a, $b) { return $b['count'] <=> $a['count']; });
+
+    $nonce = wp_create_nonce('shpk_restock_admin');
+    ?>
+    <div class="wrap" dir="rtl">
+        <h1>📦 מוצרים שאזלו מהמלאי</h1>
+        <p style="font-size:16px"><strong><?php echo count($rows); ?></strong> מוצרים אזלו מהמלאי כרגע.</p>
+        <p style="color:#666">מספר "הודיעו לי" הוא כמה פעמים לקוחות לחצו על הכפתור בעמוד המוצר (כולל לקוח שלחץ כמה פעמים) — ההודעות עצמן מגיעות לוואטסאפ של החנות.</p>
+        <?php if (!$rows): ?>
+            <p>🎉 אין כרגע מוצרים שאזלו מהמלאי.</p>
+        <?php else: ?>
+        <table class="widefat striped">
+            <thead><tr>
+                <th></th><th>מוצר</th><th>SKU</th><th>הודיעו לי</th><th>פנייה אחרונה</th><th></th>
+            </tr></thead>
+            <tbody id="shpk-restock-tbody">
+                <?php foreach ($rows as $r): $p = $r['product']; ?>
+                <tr id="shpk-restock-row-<?php echo (int) $p->get_id(); ?>">
+                    <td><img src="<?php echo esc_url(wp_get_attachment_image_url($p->get_image_id(), 'thumbnail') ?: wc_placeholder_img_src()); ?>" style="width:40px;height:40px;object-fit:cover;border-radius:4px"></td>
+                    <td><a href="<?php echo esc_url(get_edit_post_link($p->get_id())); ?>"><?php echo esc_html($p->get_name()); ?></a></td>
+                    <td><?php echo esc_html($p->get_sku()); ?></td>
+                    <td><strong><?php echo (int) $r['count']; ?></strong></td>
+                    <td><?php echo $r['last_at'] ? esc_html(date_i18n('d.m.Y H:i', strtotime($r['last_at']))) : '—'; ?></td>
+                    <td><button type="button" class="button button-primary" onclick="shpkRestockMarkInStock(<?php echo (int) $p->get_id(); ?>, this)">✓ חזר למלאי</button></td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+        <?php endif; ?>
+    </div>
+    <script>
+    function shpkRestockMarkInStock(pid, btn) {
+        btn.disabled = true;
+        btn.textContent = '⏳...';
+        var fd = new URLSearchParams({action: 'shpk_restock_mark_instock', nonce: <?php echo json_encode($nonce); ?>, product_id: pid});
+        fetch(ajaxurl, {method: 'POST', body: fd}).then(function(r){ return r.json(); }).then(function(d){
+            if (!d.success) { btn.disabled = false; btn.textContent = '✓ חזר למלאי'; alert('שגיאה: ' + (d.data || '')); return; }
+            var row = document.getElementById('shpk-restock-row-' + pid);
+            if (row) row.remove();
+        });
+    }
     </script>
     <?php
 }
